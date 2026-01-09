@@ -1,10 +1,10 @@
-﻿using System;
+﻿using ImageMagick;
+using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
 using System.Drawing;
+using System.IO;
 using System.Linq;
-using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -12,14 +12,526 @@ namespace opti_pdf
 {
     public partial class Form1 : Form
     {
+        private readonly List<string> _imageFiles = new List<string>();
+        private CancellationTokenSource _cts;
+
         public Form1()
         {
             InitializeComponent();
+
+            btnAdd.Click += BtnAdd_Click;
+            btnRemove.Click += BtnRemove_Click;
+            btnClear.Click += BtnClear_Click;
+            btnCreate.Click += BtnCreate_Click;
+            btnCancel.Click += BtnCancel_Click;
+
+            this.AllowDrop = true;
+            this.DragEnter += Form1_DragEnter;
+            this.DragDrop += Form1_DragDrop;
+
+            lvImages.AllowDrop = true;
+            lvImages.DragEnter += Form1_DragEnter;
+            lvImages.DragDrop += Form1_DragDrop;
+            lvImages.View = View.LargeIcon;
+        }
+
+        private async void BtnCreate_Click(object sender, EventArgs e)
+        {
+            if (_imageFiles.Count == 0)
+            {
+                MessageBox.Show("No se han agregado imágenes.", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Filter = "Archivo PDF|*.pdf";
+                dlg.DefaultExt = "pdf";
+                dlg.FileName = "optimizadas.pdf";
+                if (dlg.ShowDialog() != DialogResult.OK)
+                    return;
+
+                _cts = new CancellationTokenSource();
+                btnCreate.Enabled = false;
+                btnAdd.Enabled = false;
+                btnRemove.Enabled = false;
+                btnClear.Enabled = false;
+                btnCancel.Enabled = true;
+                progressBar.Value = 0;
+                progressBar.Visible = true;
+                lblStatus.Text = "Procesando...";
+
+                const int automaticQuality = 80;
+                const int automaticMaxDpi = 300;
+
+                var progress = new Progress<int>(p =>
+                {
+                    if (p < 0)
+                    {
+                        progressBar.Style = ProgressBarStyle.Marquee;
+                        progressBar.MarqueeAnimationSpeed = 30;
+                        progressBar.Visible = true;
+                        lblStatus.Text = "Procesando...";
+                        return;
+                    }
+
+                    progressBar.MarqueeAnimationSpeed = 0;
+                    progressBar.Style = ProgressBarStyle.Continuous;
+                    var clamped = Math.Max(0, Math.Min(100, p));
+                    progressBar.Value = clamped;
+                    lblStatus.Text = $"Procesando... {clamped}%";
+                });
+
+                var detailProgress = new Progress<string>(msg =>
+                {
+                    lblStatus.Text = msg;
+                });
+
+                try
+                {
+                    await Task.Run(
+                        () => CreateOptimizedPdfWithImageMagick(
+                            dlg.FileName,
+                            automaticQuality,
+                            automaticMaxDpi,
+                            progress,
+                            detailProgress,
+                            _cts.Token),
+                        _cts.Token);
+
+                    lblStatus.Text = "PDF creado exitosamente";
+                    MessageBox.Show("PDF creado exitosamente.", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (OperationCanceledException)
+                {
+                    lblStatus.Text = "Operación cancelada";
+                }
+                catch (Exception ex)
+                {
+                    lblStatus.Text = "Error al crear PDF";
+                    MessageBox.Show($"Error al crear PDF: {ex}", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                finally
+                {
+                    progressBar.Visible = false;
+                    progressBar.MarqueeAnimationSpeed = 0;
+                    progressBar.Style = ProgressBarStyle.Continuous;
+
+                    btnCreate.Enabled = true;
+                    btnAdd.Enabled = true;
+                    btnRemove.Enabled = true;
+                    btnClear.Enabled = true;
+                    btnCancel.Enabled = false;
+
+                    _cts?.Dispose();
+                    _cts = null;
+                }
+            }
+        }
+
+        private void BtnCancel_Click(object sender, EventArgs e)
+        {
+            if (_cts != null && !_cts.IsCancellationRequested)
+            {
+                lblStatus.Text = "Cancelando...";
+                _cts.Cancel();
+                btnCancel.Enabled = false;
+            }
+        }
+
+        private void CreateOptimizedPdfWithImageMagick(
+            string outputPath,
+            int initialQuality,
+            int requestedMaxDpi,
+            IProgress<int> progress,
+            IProgress<string> detailProgress,
+            CancellationToken cancellationToken)
+        {
+            const long sizeLimitBytes = 5L * 1024 * 1024;
+            const int minDpi = 150;
+            const int minQuality = 40;
+
+            if (_imageFiles.Count == 0)
+                throw new InvalidOperationException("No hay imágenes para procesar.");
+
+            progress?.Report(0);
+
+            var effectiveDpi = Math.Max(requestedMaxDpi, 300);
+            var quality = Math.Max(minQuality, Math.Min(100, initialQuality));
+
+            var tempDir = Path.GetTempPath();
+            var tempFileBase = Path.Combine(tempDir, "opti_pdf_attempt_" + Guid.NewGuid().ToString("N"));
+            string lastTemp = null;
+
+            var firstError = default(Exception);
+
+            for (var aggressiveness = 0; aggressiveness < 4; aggressiveness++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                lastTemp = tempFileBase + $"_{aggressiveness + 1}.pdf";
+
+                try
+                {
+                    var total = _imageFiles.Count;
+                    var pages = new byte[total][];
+                    var processed = 0;
+                    var options = new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
+                        CancellationToken = cancellationToken
+                    };
+
+                    Parallel.For(0, total, options, idx =>
+                    {
+                        options.CancellationToken.ThrowIfCancellationRequested();
+                        var path = _imageFiles[idx];
+                        try
+                        {
+                            var readSettings = new MagickReadSettings
+                            {
+                                ColorSpace = ColorSpace.sRGB,
+                                Density = new Density(requestedMaxDpi),
+                                FrameIndex = 0,
+                                FrameCount = 1
+                            };
+                            var originalLength = new FileInfo(path).Length;
+
+                            using (var src = new MagickImage(path, readSettings))
+                            {
+                                var srcDpiX = src.Density?.X ?? 72;
+                                var srcDpiY = src.Density?.Y ?? 72;
+                                var srcDpi = Math.Max(srcDpiX, srcDpiY);
+                                if (srcDpi <= 0)
+                                    srcDpi = 72;
+
+                                var targetDpi = Math.Max(minDpi, effectiveDpi - aggressiveness * 50);
+
+                                double scale = 1.0;
+                                if (srcDpi > targetDpi)
+                                    scale = (double)targetDpi / srcDpi;
+                                else if (srcDpi < targetDpi && (src.Width >= targetDpi || src.Height >= targetDpi))
+                                    scale = (double)targetDpi / srcDpi;
+
+                                var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
+                                var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
+
+                                using (var img = src.Clone())
+                                {
+                                    if (scale < 0.999 || scale > 1.001)
+                                    {
+                                        img.FilterType = FilterType.Cubic;
+                                        img.Resize((uint)newWidth, (uint)newHeight);
+                                    }
+
+                                    var attemptQuality = Math.Max(minQuality, quality - aggressiveness * 12);
+                                    ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+
+                                    using (var ms = new MemoryStream())
+                                    {
+                                        img.Format = MagickFormat.Jpeg;
+                                        img.Write(ms);
+                                        pages[idx] = ms.ToArray();
+                                        var newLength = ms.Length;
+                                        var reductionPct = originalLength > 0
+                                            ? (100.0 * (originalLength - newLength) / originalLength)
+                                            : 0.0;
+                                        detailProgress?.Report(
+                                            $"[{idx + 1}/{total}] {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.CompareExchange(ref firstError, ex, null);
+                        }
+                        finally
+                        {
+                            var done = Interlocked.Increment(ref processed);
+                            var percent = (int)Math.Round(done * 80.0 / total);
+                            progress?.Report(percent);
+                        }
+                    });
+
+                    using (var collection = new MagickImageCollection())
+                    {
+                        var locker = new object();
+                        Parallel.For(0, total, options, idx =>
+                        {
+                            options.CancellationToken.ThrowIfCancellationRequested();
+                            var path = _imageFiles[idx];
+                            try
+                            {
+                                var readSettings = new MagickReadSettings
+                                {
+                                    ColorSpace = ColorSpace.sRGB,
+                                    Density = new Density(requestedMaxDpi),
+                                    FrameIndex = 0,
+                                    FrameCount = 1
+                                };
+                                var originalLength = new FileInfo(path).Length;
+
+                                using (var src = new MagickImage(path, readSettings))
+                                {
+                                    var srcDpiX = src.Density?.X ?? 72;
+                                    var srcDpiY = src.Density?.Y ?? 72;
+                                    var srcDpi = Math.Max(srcDpiX, srcDpiY);
+                                    if (srcDpi <= 0)
+                                        srcDpi = 72;
+
+                                    var targetDpi = Math.Max(minDpi, effectiveDpi - aggressiveness * 50);
+
+                                    double scale = 1.0;
+                                    if (srcDpi > targetDpi)
+                                        scale = (double)targetDpi / srcDpi;
+                                    else if (srcDpi < targetDpi && (src.Width >= targetDpi || src.Height >= targetDpi))
+                                        scale = (double)targetDpi / srcDpi;
+
+                                    var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
+                                    var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
+
+                                    using (var img = src.Clone())
+                                    {
+                                        if (scale < 0.999 || scale > 1.001)
+                                        {
+                                            img.FilterType = FilterType.Cubic;
+                                            img.Resize((uint)newWidth, (uint)newHeight);
+                                        }
+
+                                        var attemptQuality = Math.Max(minQuality, quality - aggressiveness * 12);
+                                        ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+
+                                        using (var ms = new MemoryStream())
+                                        {
+                                            img.Format = MagickFormat.Jpeg;
+                                            img.Write(ms);
+                                            ms.Position = 0;
+                                            var page = new MagickImage(ms);
+                                            lock (locker)
+                                            {
+                                                collection.Add(page);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Interlocked.CompareExchange(ref firstError, ex, null);
+                            }
+                            finally
+                            {
+                                var done = Interlocked.Increment(ref processed);
+                                var percent = (int)Math.Round(done * 80.0 / total);
+                                progress?.Report(percent);
+                            }
+                        });
+
+                        if (collection.Count == 0)
+                            throw firstError ?? new InvalidOperationException("No se pudieron procesar las imágenes.");
+
+                        progress?.Report(-1);
+                        collection.Write(lastTemp, MagickFormat.Pdf);
+                        progress?.Report(85);
+                    }
+
+                    var fi = new FileInfo(lastTemp);
+                    var producedSize = fi.Exists ? fi.Length : 0;
+
+                    if (producedSize <= sizeLimitBytes)
+                    {
+                        if (File.Exists(outputPath))
+                            File.Delete(outputPath);
+
+                        File.Move(lastTemp, outputPath);
+                        lastTemp = null;
+                        progress?.Report(100);
+                        return;
+                    }
+
+                    quality = Math.Max(minQuality, quality - 8);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    if (aggressiveness == 3)
+                        throw new InvalidOperationException("Fallo al crear el PDF.", ex);
+                }
+                finally
+                {
+                    progress?.Report(Math.Min(95, 80 + aggressiveness * 5));
+                }
+            }
+
+            if (!string.IsNullOrEmpty(lastTemp) && File.Exists(lastTemp))
+            {
+                if (File.Exists(outputPath))
+                    File.Delete(outputPath);
+
+                File.Move(lastTemp, outputPath);
+                progress?.Report(100);
+            }
+        }
+
+        private static void ApplyLegalOptimizations(MagickImage img, int jpegQuality, int targetDpi, int aggressiveness)
+        {
+            img.Strip();
+            img.ColorSpace = ColorSpace.sRGB;
+
+            if (aggressiveness >= 2)
+            {
+                try { img.AutoLevel(); } catch { }
+                try { img.Normalize(); } catch { }
+                for (var i = 0; i < 1 + aggressiveness; i++)
+                {
+                    try { img.Despeckle(); } catch { }
+                }
+            }
+            else
+            {
+                try { img.Despeckle(); } catch { }
+            }
+
+            img.Density = new Density(targetDpi);
+            img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
+            img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+            img.Quality = (uint)jpegQuality;
+            img.FilterType = FilterType.Cubic;
+        }
+
+        private void BtnAdd_Click(object sender, EventArgs e)
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Multiselect = true;
+                dlg.Filter = "Imágenes|*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff;*.gif";
+                if (dlg.ShowDialog() != DialogResult.OK)
+                    return;
+
+                AddFiles(dlg.FileNames);
+            }
+        }
+
+        private void BtnRemove_Click(object sender, EventArgs e)
+        {
+            var items = lvImages.SelectedItems.Cast<ListViewItem>().ToArray();
+            foreach (var it in items)
+            {
+                var path = it.Tag as string;
+                if (!string.IsNullOrEmpty(path))
+                {
+                    _imageFiles.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase));
+                    if (imgListSmall.Images.ContainsKey(path))
+                        imgListSmall.Images.RemoveByKey(path);
+                    if (imgListLarge.Images.ContainsKey(path))
+                        imgListLarge.Images.RemoveByKey(path);
+                }
+
+                lvImages.Items.Remove(it);
+            }
+
+            lblStatus.Text = $"Se eliminaron {items.Length} elemento(s)";
+        }
+
+        private void BtnClear_Click(object sender, EventArgs e)
+        {
+            _imageFiles.Clear();
+            lvImages.Items.Clear();
+            imgListSmall.Images.Clear();
+            imgListLarge.Images.Clear();
+            lblStatus.Text = "Todas las imágenes eliminadas";
+        }
+
+        private void Form1_DragEnter(object sender, DragEventArgs e)
+        {
+            if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+                e.Effect = DragDropEffects.Copy;
+            else
+                e.Effect = DragDropEffects.None;
+        }
+
+        private void Form1_DragDrop(object sender, DragEventArgs e)
+        {
+            if (e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop))
+                return;
+
+            var files = (string[])e.Data.GetData(DataFormats.FileDrop);
+            var images = files.Where(f =>
+            {
+                var ext = Path.GetExtension(f)?.ToLowerInvariant();
+                return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".tif" || ext == ".tiff" || ext == ".gif";
+            }).ToArray();
+
+            if (images.Length > 0)
+                AddFiles(images);
+        }
+
+        private void AddFiles(IEnumerable<string> files)
+        {
+            var added = 0;
+            foreach (var file in files)
+            {
+                if (string.IsNullOrWhiteSpace(file))
+                    continue;
+
+                if (_imageFiles.Contains(file, StringComparer.OrdinalIgnoreCase))
+                    continue;
+
+                try
+                {
+                    using (var original = new MagickImage(file))
+                    {
+                        using (var small = original.Clone())
+                        using (var large = original.Clone())
+                        {
+                            small.Resize((uint)imgListSmall.ImageSize.Width, (uint)imgListSmall.ImageSize.Height);
+                            large.Resize((uint)imgListLarge.ImageSize.Width, (uint)imgListLarge.ImageSize.Height);
+                            using (var ms = new MemoryStream())
+                            {
+                                small.Write(ms, MagickFormat.Bmp);
+                                ms.Position = 0;
+                                imgListSmall.Images.Add(file, new Bitmap(ms));
+                            }
+                            using (var ms = new MemoryStream())
+                            {
+                                large.Write(ms, MagickFormat.Bmp);
+                                ms.Position = 0;
+                                imgListLarge.Images.Add(file, new Bitmap(ms));
+                            }
+                        }
+                    }
+
+                    var item = new ListViewItem
+                    {
+                        Text = Path.GetFileName(file),
+                        ImageKey = file,
+                        Tag = file
+                    };
+
+                    lvImages.Items.Add(item);
+                    _imageFiles.Add(file);
+                    added++;
+                }
+                catch (Exception ex)
+                {
+                    lblStatus.Text = $"Advertencia: no se pudo cargar {Path.GetFileName(file)} ({ex.Message})";
+                }
+            }
+
+            lblStatus.Text = $"Se agregaron {added} imagen(es)";
         }
 
         private void Form1_Load(object sender, EventArgs e)
         {
-
+            AllowDrop = true;
+            lvImages.AllowDrop = true;
+            progressBar.Visible = false;
+            progressBar.MarqueeAnimationSpeed = 0;
+            progressBar.Style = ProgressBarStyle.Continuous;
+            lblStatus.Text = "LISTO";
         }
     }
 }

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" name="opti_pdf.app" />
+  <description>opti_pdf application manifest</description>
+
+  <!-- Requested execution level -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Per-monitor v2 DPI awareness (Windows 10+). Use the WindowsSettings namespace. -->
+  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3"
+                     xmlns:ms_windowsSettings="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+    <asmv3:windowsSettings>
+      <ms_windowsSettings:dpiAwareness>PerMonitorV2</ms_windowsSettings:dpiAwareness>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+
+  <!-- Optional minimal legacy compatibility entry for older Windows -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <dpiAware>true</dpiAware>
+    </application>
+  </compatibility>
+</assembly>
