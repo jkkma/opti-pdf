@@ -161,26 +161,37 @@ namespace opti_pdf
 
             var tempDir = Path.GetTempPath();
             var tempFileBase = Path.Combine(tempDir, "opti_pdf_attempt_" + Guid.NewGuid().ToString("N"));
-            string lastTemp = null;
+            string bestTemp = null;
+            long bestSize = long.MaxValue;
+            var outputWritten = false;
 
-            var firstError = default(Exception);
-
-            for (var aggressiveness = 0; aggressiveness < 4; aggressiveness++)
+            void PromoteToOutput(string tempPath)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                lastTemp = tempFileBase + $"_{aggressiveness + 1}.pdf";
+                if (string.IsNullOrEmpty(tempPath) || !File.Exists(tempPath))
+                    return;
 
-                try
+                if (File.Exists(outputPath))
+                    File.Delete(outputPath);
+
+                File.Move(tempPath, outputPath);
+                outputWritten = true;
+                progress?.Report(100);
+            }
+
+            long RunPdfPass(string tempPath, int effectiveDpiParam, int baseQuality, int aggressiveness, bool gentle)
+            {
+                var total = _imageFiles.Count;
+                var processed = 0;
+                var options = new ParallelOptions
                 {
-                    var total = _imageFiles.Count;
-                    var pages = new byte[total][];
-                    var processed = 0;
-                    var options = new ParallelOptions
-                    {
-                        MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
-                        CancellationToken = cancellationToken
-                    };
+                    MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
+                    CancellationToken = cancellationToken
+                };
+                var locker = new object();
+                var localFirstError = default(Exception);
 
+                using (var collection = new MagickImageCollection())
+                {
                     Parallel.For(0, total, options, idx =>
                     {
                         options.CancellationToken.ThrowIfCancellationRequested();
@@ -204,33 +215,64 @@ namespace opti_pdf
                                 if (srcDpi <= 0)
                                     srcDpi = 72;
 
-                                var targetDpi = Math.Max(minDpi, effectiveDpi - aggressiveness * 50);
+                                var targetDpi = gentle
+                                    ? (int)Math.Max(minDpi, srcDpi)
+                                    : Math.Max(minDpi, effectiveDpiParam - aggressiveness * 50);
 
                                 double scale = 1.0;
-                                if (srcDpi > targetDpi)
-                                    scale = (double)targetDpi / srcDpi;
-                                else if (srcDpi < targetDpi && (src.Width >= targetDpi || src.Height >= targetDpi))
-                                    scale = (double)targetDpi / srcDpi;
+                                if (!gentle)
+                                {
+                                    if (srcDpi > targetDpi)
+                                        scale = (double)targetDpi / srcDpi;
+                                    else if (srcDpi < targetDpi && (src.Width >= targetDpi || src.Height >= targetDpi))
+                                        scale = (double)targetDpi / srcDpi;
+                                }
 
                                 var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
                                 var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
 
                                 using (var img = src.Clone())
                                 {
-                                    if (scale < 0.999 || scale > 1.001)
+                                    if (!gentle && (scale < 0.999 || scale > 1.001))
                                     {
                                         img.FilterType = FilterType.Cubic;
                                         img.Resize((uint)newWidth, (uint)newHeight);
                                     }
 
-                                    var attemptQuality = Math.Max(minQuality, quality - aggressiveness * 12);
-                                    ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+                                    if (gentle)
+                                    {
+                                        img.Strip();
+                                        img.ColorSpace = ColorSpace.sRGB;
+                                        img.Density = new Density(targetDpi);
+                                        img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
+                                        img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+                                        img.Quality = (uint)baseQuality;
+                                        img.FilterType = FilterType.Cubic;
+                                    }
+                                    else
+                                    {
+                                        var attemptQuality = Math.Max(minQuality, baseQuality - aggressiveness * 12);
+                                        ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+                                    }
 
                                     using (var ms = new MemoryStream())
                                     {
                                         img.Format = MagickFormat.Jpeg;
                                         img.Write(ms);
-                                        pages[idx] = ms.ToArray();
+                                        ms.Position = 0;
+                                        var page = new MagickImage(ms.ToArray());
+                                        try
+                                        {
+                                            lock (locker)
+                                            {
+                                                collection.Add(page.Clone());
+                                            }
+                                        }
+                                        finally
+                                        {
+                                            page.Dispose();
+                                        }
+
                                         var newLength = ms.Length;
                                         var reductionPct = originalLength > 0
                                             ? (100.0 * (originalLength - newLength) / originalLength)
@@ -243,7 +285,7 @@ namespace opti_pdf
                         }
                         catch (Exception ex)
                         {
-                            Interlocked.CompareExchange(ref firstError, ex, null);
+                            Interlocked.CompareExchange(ref localFirstError, ex, null);
                         }
                         finally
                         {
@@ -253,126 +295,126 @@ namespace opti_pdf
                         }
                     });
 
-                    using (var collection = new MagickImageCollection())
+                    if (collection.Count == 0)
+                        throw localFirstError ?? new InvalidOperationException("No se pudieron procesar las imágenes.");
+
+                    progress?.Report(-1);
+                    collection.Write(tempPath, MagickFormat.Pdf);
+                    progress?.Report(85);
+                }
+
+                var fi = new FileInfo(tempPath);
+                return fi.Exists ? fi.Length : 0;
+            }
+
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // First gentle pass
+                var gentleTemp = tempFileBase + "_gentle.pdf";
+                var gentleSize = RunPdfPass(gentleTemp, Math.Max(minDpi, requestedMaxDpi), quality, 0, true);
+                bestTemp = gentleTemp;
+                bestSize = gentleSize;
+
+                if (bestSize <= sizeLimitBytes)
+                {
+                    PromoteToOutput(bestTemp);
+                    return;
+                }
+
+                // Quality search at current DPI (find highest quality that fits)
+                var lowQ = minQuality;
+                var highQ = quality;
+                while (lowQ <= highQ && bestSize > sizeLimitBytes)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var midQ = (lowQ + highQ) / 2;
+                    var attemptTemp = tempFileBase + $"_q{midQ}.pdf";
+                    var attemptSize = RunPdfPass(attemptTemp, effectiveDpi, midQ, 0, false);
+
+                    if (attemptSize <= sizeLimitBytes)
                     {
-                        var locker = new object();
-                        Parallel.For(0, total, options, idx =>
+                        // Fits: keep as best and try higher quality
+                        if (attemptSize < bestSize)
                         {
-                            options.CancellationToken.ThrowIfCancellationRequested();
-                            var path = _imageFiles[idx];
-                            try
-                            {
-                                var readSettings = new MagickReadSettings
-                                {
-                                    ColorSpace = ColorSpace.sRGB,
-                                    Density = new Density(requestedMaxDpi),
-                                    FrameIndex = 0,
-                                    FrameCount = 1
-                                };
-                                var originalLength = new FileInfo(path).Length;
+                            if (!string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
+                                File.Delete(bestTemp);
 
-                                using (var src = new MagickImage(path, readSettings))
-                                {
-                                    var srcDpiX = src.Density?.X ?? 72;
-                                    var srcDpiY = src.Density?.Y ?? 72;
-                                    var srcDpi = Math.Max(srcDpiX, srcDpiY);
-                                    if (srcDpi <= 0)
-                                        srcDpi = 72;
+                            bestTemp = attemptTemp;
+                            bestSize = attemptSize;
+                        }
+                        else if (File.Exists(attemptTemp))
+                        {
+                            File.Delete(attemptTemp);
+                        }
 
-                                    var targetDpi = Math.Max(minDpi, effectiveDpi - aggressiveness * 50);
+                        lowQ = midQ + 1;
+                    }
+                    else
+                    {
+                        // Too big: try lower quality
+                        if (File.Exists(attemptTemp))
+                            File.Delete(attemptTemp);
 
-                                    double scale = 1.0;
-                                    if (srcDpi > targetDpi)
-                                        scale = (double)targetDpi / srcDpi;
-                                    else if (srcDpi < targetDpi && (src.Width >= targetDpi || src.Height >= targetDpi))
-                                        scale = (double)targetDpi / srcDpi;
+                        highQ = midQ - 1;
+                    }
+                }
 
-                                    var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
-                                    var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
+                if (bestSize <= sizeLimitBytes)
+                {
+                    PromoteToOutput(bestTemp);
+                    bestTemp = null;
+                    return;
+                }
 
-                                    using (var img = src.Clone())
-                                    {
-                                        if (scale < 0.999 || scale > 1.001)
-                                        {
-                                            img.FilterType = FilterType.Cubic;
-                                            img.Resize((uint)newWidth, (uint)newHeight);
-                                        }
+                // Progressive optimizations only if still over 5 MB
+                for (var aggressiveness = 0; aggressiveness < 4 && bestSize > sizeLimitBytes; aggressiveness++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                                        var attemptQuality = Math.Max(minQuality, quality - aggressiveness * 12);
-                                        ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+                    var attemptTemp = tempFileBase + $"_{aggressiveness + 1}.pdf";
+                    var attemptSize = RunPdfPass(attemptTemp, effectiveDpi, quality, aggressiveness, false);
 
-                                        using (var ms = new MemoryStream())
-                                        {
-                                            img.Format = MagickFormat.Jpeg;
-                                            img.Write(ms);
-                                            ms.Position = 0;
-                                            var page = new MagickImage(ms);
-                                            lock (locker)
-                                            {
-                                                collection.Add(page);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Interlocked.CompareExchange(ref firstError, ex, null);
-                            }
-                            finally
-                            {
-                                var done = Interlocked.Increment(ref processed);
-                                var percent = (int)Math.Round(done * 80.0 / total);
-                                progress?.Report(percent);
-                            }
-                        });
+                    if (attemptSize < bestSize)
+                    {
+                        if (!string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
+                            File.Delete(bestTemp);
 
-                        if (collection.Count == 0)
-                            throw firstError ?? new InvalidOperationException("No se pudieron procesar las imágenes.");
-
-                        progress?.Report(-1);
-                        collection.Write(lastTemp, MagickFormat.Pdf);
-                        progress?.Report(85);
+                        bestTemp = attemptTemp;
+                        bestSize = attemptSize;
+                    }
+                    else if (File.Exists(attemptTemp))
+                    {
+                        File.Delete(attemptTemp);
                     }
 
-                    var fi = new FileInfo(lastTemp);
-                    var producedSize = fi.Exists ? fi.Length : 0;
-
-                    if (producedSize <= sizeLimitBytes)
+                    if (bestSize <= sizeLimitBytes)
                     {
-                        if (File.Exists(outputPath))
-                            File.Delete(outputPath);
-
-                        File.Move(lastTemp, outputPath);
-                        lastTemp = null;
-                        progress?.Report(100);
+                        PromoteToOutput(bestTemp);
+                        bestTemp = null;
                         return;
                     }
 
                     quality = Math.Max(minQuality, quality - 8);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    if (aggressiveness == 3)
-                        throw new InvalidOperationException("Fallo al crear el PDF.", ex);
-                }
-                finally
-                {
                     progress?.Report(Math.Min(95, 80 + aggressiveness * 5));
                 }
             }
-
-            if (!string.IsNullOrEmpty(lastTemp) && File.Exists(lastTemp))
+            catch (OperationCanceledException)
             {
-                if (File.Exists(outputPath))
-                    File.Delete(outputPath);
-
-                File.Move(lastTemp, outputPath);
-                progress?.Report(100);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Fallo al crear el PDF.", ex);
+            }
+            finally
+            {
+                if (!outputWritten && !string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
+                {
+                    PromoteToOutput(bestTemp);
+                }
             }
         }
 

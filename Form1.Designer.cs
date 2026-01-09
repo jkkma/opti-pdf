@@ -51,7 +51,7 @@
             this.lvImages.Location = new System.Drawing.Point(20, 32);
             this.lvImages.Margin = new System.Windows.Forms.Padding(45, 23, 45, 23);
             this.lvImages.Name = "lvImages";
-            this.lvImages.Size = new System.Drawing.Size(1230, 508);
+            this.lvImages.Size = new System.Drawing.Size(1198, 466);
             this.lvImages.SmallImageList = this.imgListSmall;
             this.lvImages.TabIndex = 0;
             this.lvImages.UseCompatibleStateImageBehavior = false;
@@ -71,9 +71,9 @@
             // btnAdd
             // 
             this.btnAdd.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)));
-            this.btnAdd.Location = new System.Drawing.Point(20, 560);
+            this.btnAdd.Location = new System.Drawing.Point(20, 524);
             this.btnAdd.Name = "btnAdd";
-            this.btnAdd.Size = new System.Drawing.Size(180, 50);
+            this.btnAdd.Size = new System.Drawing.Size(180, 78);
             this.btnAdd.TabIndex = 12;
             this.btnAdd.Text = "Agregar imágenes";
             this.btnAdd.UseVisualStyleBackColor = true;
@@ -81,9 +81,9 @@
             // btnRemove
             // 
             this.btnRemove.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)));
-            this.btnRemove.Location = new System.Drawing.Point(210, 560);
+            this.btnRemove.Location = new System.Drawing.Point(206, 524);
             this.btnRemove.Name = "btnRemove";
-            this.btnRemove.Size = new System.Drawing.Size(200, 50);
+            this.btnRemove.Size = new System.Drawing.Size(205, 78);
             this.btnRemove.TabIndex = 11;
             this.btnRemove.Text = "Eliminar seleccionados";
             this.btnRemove.UseVisualStyleBackColor = true;
@@ -91,9 +91,9 @@
             // btnClear
             // 
             this.btnClear.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)));
-            this.btnClear.Location = new System.Drawing.Point(420, 560);
+            this.btnClear.Location = new System.Drawing.Point(417, 523);
             this.btnClear.Name = "btnClear";
-            this.btnClear.Size = new System.Drawing.Size(180, 50);
+            this.btnClear.Size = new System.Drawing.Size(180, 79);
             this.btnClear.TabIndex = 10;
             this.btnClear.Text = "Borrar todo";
             this.btnClear.UseVisualStyleBackColor = true;
@@ -101,10 +101,10 @@
             // progressBar
             // 
             this.progressBar.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)));
-            this.progressBar.Location = new System.Drawing.Point(20, 616);
+            this.progressBar.Location = new System.Drawing.Point(20, 607);
             this.progressBar.MarqueeAnimationSpeed = 0;
             this.progressBar.Name = "progressBar";
-            this.progressBar.Size = new System.Drawing.Size(1230, 41);
+            this.progressBar.Size = new System.Drawing.Size(1198, 42);
             this.progressBar.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
             this.progressBar.TabIndex = 8;
             this.progressBar.Visible = false;
@@ -112,10 +112,10 @@
             // lblStatus
             // 
             this.lblStatus.Dock = System.Windows.Forms.DockStyle.Bottom;
-            this.lblStatus.Location = new System.Drawing.Point(0, 680);
+            this.lblStatus.Location = new System.Drawing.Point(0, 672);
             this.lblStatus.Margin = new System.Windows.Forms.Padding(45, 0, 45, 0);
             this.lblStatus.Name = "lblStatus";
-            this.lblStatus.Size = new System.Drawing.Size(1280, 40);
+            this.lblStatus.Size = new System.Drawing.Size(1248, 40);
             this.lblStatus.TabIndex = 9;
             this.lblStatus.Text = "LISTO";
             // 
@@ -123,29 +123,29 @@
             // 
             this.btnCreate.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right)));
             this.btnCreate.Font = new System.Drawing.Font("Microsoft Sans Serif", 9.900001F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.btnCreate.Location = new System.Drawing.Point(1010, 560);
+            this.btnCreate.Location = new System.Drawing.Point(983, 523);
             this.btnCreate.Name = "btnCreate";
-            this.btnCreate.Size = new System.Drawing.Size(240, 50);
+            this.btnCreate.Size = new System.Drawing.Size(235, 79);
             this.btnCreate.TabIndex = 0;
-            this.btnCreate.Text = "CREAR PDF OPTIMIZADO";
+            this.btnCreate.Text = "CREAR PDF";
             this.btnCreate.UseVisualStyleBackColor = true;
             // 
             // btnCancel
             // 
             this.btnCancel.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Right)));
-            this.btnCancel.Location = new System.Drawing.Point(820, 560);
+            this.btnCancel.Enabled = false;
+            this.btnCancel.Location = new System.Drawing.Point(753, 523);
             this.btnCancel.Name = "btnCancel";
-            this.btnCancel.Size = new System.Drawing.Size(180, 50);
+            this.btnCancel.Size = new System.Drawing.Size(180, 78);
             this.btnCancel.TabIndex = 13;
             this.btnCancel.Text = "Cancelar";
             this.btnCancel.UseVisualStyleBackColor = true;
-            this.btnCancel.Enabled = false;
             // 
             // Form1
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(240F, 240F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
-            this.ClientSize = new System.Drawing.Size(1280, 720);
+            this.ClientSize = new System.Drawing.Size(1248, 712);
             this.Controls.Add(this.btnCancel);
             this.Controls.Add(this.btnCreate);
             this.Controls.Add(this.lblStatus);
