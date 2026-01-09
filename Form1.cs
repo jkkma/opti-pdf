@@ -14,6 +14,9 @@ namespace opti_pdf
     {
         private readonly List<string> _imageFiles = new List<string>();
         private CancellationTokenSource _cts;
+        private string _lastDetailStatus = "LISTO";
+
+        private static readonly object _logSync = new object();
 
         public Form1()
         {
@@ -52,6 +55,7 @@ namespace opti_pdf
                     return;
 
                 _cts = new CancellationTokenSource();
+                _lastDetailStatus = "Procesando...";
                 btnCreate.Enabled = false;
                 btnAdd.Enabled = false;
                 btnRemove.Enabled = false;
@@ -66,12 +70,14 @@ namespace opti_pdf
 
                 var progress = new Progress<int>(p =>
                 {
+                    var baseText = string.IsNullOrEmpty(_lastDetailStatus) ? "Procesando..." : _lastDetailStatus;
+
                     if (p < 0)
                     {
                         progressBar.Style = ProgressBarStyle.Marquee;
                         progressBar.MarqueeAnimationSpeed = 30;
                         progressBar.Visible = true;
-                        lblStatus.Text = "Procesando...";
+                        SetStatus(baseText);
                         return;
                     }
 
@@ -79,12 +85,13 @@ namespace opti_pdf
                     progressBar.Style = ProgressBarStyle.Continuous;
                     var clamped = Math.Max(0, Math.Min(100, p));
                     progressBar.Value = clamped;
-                    lblStatus.Text = $"Procesando... {clamped}%";
+                    SetStatus($"{baseText} ({clamped}%)");
                 });
 
                 var detailProgress = new Progress<string>(msg =>
                 {
-                    lblStatus.Text = msg;
+                    _lastDetailStatus = msg;
+                    SetStatus(msg);
                 });
 
                 try
@@ -108,8 +115,10 @@ namespace opti_pdf
                 }
                 catch (Exception ex)
                 {
-                    lblStatus.Text = "Error al crear PDF";
-                    MessageBox.Show($"Error al crear PDF: {ex}", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    LogError("BtnCreate_Click", ex);
+                    var message = $"Error al crear PDF: {ex.GetBaseException()?.Message ?? ex.Message}";
+                    SetStatus("Error al crear PDF");
+                    MessageBox.Show(message, "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally
                 {
@@ -277,8 +286,9 @@ namespace opti_pdf
                                         var reductionPct = originalLength > 0
                                             ? (100.0 * (originalLength - newLength) / originalLength)
                                             : 0.0;
+                                        var aggressivenessLabel = gentle ? "suave" : aggressiveness.ToString();
                                         detailProgress?.Report(
-                                            $"[{idx + 1}/{total}] {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
+                                            $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
                                     }
                                 }
                             }
@@ -286,6 +296,9 @@ namespace opti_pdf
                         catch (Exception ex)
                         {
                             Interlocked.CompareExchange(ref localFirstError, ex, null);
+                            LogError($"Imagen {Path.GetFileName(path)}", ex);
+                            detailProgress?.Report(
+                                $"[{idx + 1}/{total}] Error en {Path.GetFileName(path)}: {ex.Message}");
                         }
                         finally
                         {
@@ -407,6 +420,7 @@ namespace opti_pdf
             }
             catch (Exception ex)
             {
+                LogError("CreateOptimizedPdfWithImageMagick", ex);
                 throw new InvalidOperationException("Fallo al crear el PDF.", ex);
             }
             finally
@@ -574,6 +588,34 @@ namespace opti_pdf
             progressBar.MarqueeAnimationSpeed = 0;
             progressBar.Style = ProgressBarStyle.Continuous;
             lblStatus.Text = "LISTO";
+        }
+
+        private void SetStatus(string text)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke((Action)(() => lblStatus.Text = text));
+                return;
+            }
+
+            lblStatus.Text = text;
+        }
+
+        private static void LogError(string context, Exception ex)
+        {
+            try
+            {
+                var logFile = Path.Combine(Path.GetTempPath(), "opti_pdf.log");
+                var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{context}] {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}{Environment.NewLine}";
+                lock (_logSync)
+                {
+                    File.AppendAllText(logFile, line);
+                }
+            }
+            catch
+            {
+                // Intentionally ignore logging failures.
+            }
         }
     }
 }
