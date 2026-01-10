@@ -196,126 +196,128 @@ namespace opti_pdf
                     MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
                     CancellationToken = cancellationToken
                 };
-                var locker = new object();
                 var localFirstError = default(Exception);
+                var pageBuffers = new byte[total][];
 
-                using (var collection = new MagickImageCollection())
+                Parallel.For(0, total, options, idx =>
                 {
-                    Parallel.For(0, total, options, idx =>
+                    options.CancellationToken.ThrowIfCancellationRequested();
+                    var path = _imageFiles[idx];
+                    try
                     {
-                        options.CancellationToken.ThrowIfCancellationRequested();
-                        var path = _imageFiles[idx];
-                        try
+                        var readSettings = new MagickReadSettings
                         {
-                            var readSettings = new MagickReadSettings
+                            ColorSpace = ColorSpace.sRGB,
+                            FrameIndex = 0,
+                            FrameCount = 1
+                        };
+                        var originalLength = new FileInfo(path).Length;
+
+                        using (var src = new MagickImage(path, readSettings))
+                        {
+                            var srcDpiX = src.Density?.X ?? 72;
+                            var srcDpiY = src.Density?.Y ?? 72;
+                            var srcDpi = Math.Max(srcDpiX, srcDpiY);
+                            if (srcDpi <= 0)
+                                srcDpi = 72;
+
+                            var desiredDpi = gentle
+                                ? requestedMaxDpi
+                                : Math.Max(minDpi, effectiveDpiParam - aggressiveness * 50);
+                            var targetDpi = (int)Math.Max(1, Math.Min(desiredDpi, srcDpi));
+                            var targetWasClamped = targetDpi < desiredDpi;
+
+                            double scale = 1.0;
+                            if (!gentle && targetDpi < srcDpi)
                             {
-                                ColorSpace = ColorSpace.sRGB,
-                                FrameIndex = 0,
-                                FrameCount = 1
-                            };
-                            var originalLength = new FileInfo(path).Length;
+                                scale = (double)targetDpi / srcDpi;
+                            }
 
-                            using (var src = new MagickImage(path, readSettings))
+                            var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
+                            var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
+
+                            using (var img = src.Clone())
                             {
-                                var srcDpiX = src.Density?.X ?? 72;
-                                var srcDpiY = src.Density?.Y ?? 72;
-                                var srcDpi = Math.Max(srcDpiX, srcDpiY);
-                                if (srcDpi <= 0)
-                                    srcDpi = 72;
-
-                                var desiredDpi = gentle
-                                    ? requestedMaxDpi
-                                    : Math.Max(minDpi, effectiveDpiParam - aggressiveness * 50);
-                                var targetDpi = (int)Math.Max(1, Math.Min(desiredDpi, srcDpi));
-                                var targetWasClamped = targetDpi < desiredDpi;
-
-                                double scale = 1.0;
-                                if (!gentle && targetDpi < srcDpi)
+                                if (!gentle && (scale < 0.999 || scale > 1.001))
                                 {
-                                    scale = (double)targetDpi / srcDpi;
+                                    img.FilterType = FilterType.Cubic;
+                                    img.Resize((uint)newWidth, (uint)newHeight);
                                 }
 
-                                var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
-                                var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
-
-                                using (var img = src.Clone())
+                                if (gentle)
                                 {
-                                    if (!gentle && (scale < 0.999 || scale > 1.001))
-                                    {
-                                        img.FilterType = FilterType.Cubic;
-                                        img.Resize((uint)newWidth, (uint)newHeight);
-                                    }
+                                    img.Strip();
+                                    img.ColorSpace = ColorSpace.sRGB;
+                                    img.Density = new Density(targetDpi);
+                                    img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
+                                    img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+                                    img.Quality = (uint)baseQuality;
+                                    img.FilterType = FilterType.Cubic;
+                                }
+                                else
+                                {
+                                    var attemptQuality = Math.Max(minQuality, baseQuality - aggressiveness * 12);
+                                    ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+                                }
 
-                                    if (gentle)
-                                    {
-                                        img.Strip();
-                                        img.ColorSpace = ColorSpace.sRGB;
-                                        img.Density = new Density(targetDpi);
-                                        img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
-                                        img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
-                                        img.Quality = (uint)baseQuality;
-                                        img.FilterType = FilterType.Cubic;
-                                    }
-                                    else
-                                    {
-                                        var attemptQuality = Math.Max(minQuality, baseQuality - aggressiveness * 12);
-                                        ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
-                                    }
+                                using (var ms = new MemoryStream())
+                                {
+                                    img.Format = MagickFormat.Jpeg;
+                                    img.Write(ms);
+                                    pageBuffers[idx] = ms.ToArray();
 
-                                    using (var ms = new MemoryStream())
-                                    {
-                                        img.Format = MagickFormat.Jpeg;
-                                        img.Write(ms);
-                                        ms.Position = 0;
-                                        var page = new MagickImage(ms.ToArray());
-                                        try
-                                        {
-                                            lock (locker)
-                                            {
-                                                collection.Add(page.Clone());
-                                            }
-                                        }
-                                        finally
-                                        {
-                                            page.Dispose();
-                                        }
-
-                                        var newLength = ms.Length;
-                                        var reductionPct = originalLength > 0
-                                            ? (100.0 * (originalLength - newLength) / originalLength)
-                                            : 0.0;
-                                        var aggressivenessLabel = gentle
-                                            ? "Nivel 1 (suave)"
-                                            : $"Nivel {Math.Max(1, aggressiveness + 1)}";
-                                        var clampSuffix = targetWasClamped ? " (limitado por DPI de origen)" : string.Empty;
-                                        detailProgress?.Report(
-                                            $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi}{clampSuffix} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
-                                    }
+                                    var newLength = ms.Length;
+                                    var reductionPct = originalLength > 0
+                                        ? (100.0 * (originalLength - newLength) / originalLength)
+                                        : 0.0;
+                                    var aggressivenessLabel = gentle
+                                        ? "Nivel 0 (suave)"
+                                        : $"Nivel {Math.Max(1, aggressiveness + 1)}";
+                                    var clampSuffix = targetWasClamped ? " (limitado por DPI de origen)" : string.Empty;
+                                    detailProgress?.Report(
+                                        $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi}{clampSuffix} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
                                 }
                             }
                         }
-                        catch (Exception ex)
-                        {
-                            Interlocked.CompareExchange(ref localFirstError, ex, null);
-                            LogError($"Imagen {Path.GetFileName(path)}", ex);
-                            detailProgress?.Report(
-                                $"[{idx + 1}/{total}] Error en {Path.GetFileName(path)}: {ex.Message}");
-                        }
-                        finally
-                        {
-                            var done = Interlocked.Increment(ref processed);
-                            var percent = (int)Math.Round(done * 80.0 / total);
-                            progress?.Report(percent);
-                        }
-                    });
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.CompareExchange(ref localFirstError, ex, null);
+                        LogError($"Imagen {Path.GetFileName(path)}", ex);
+                        detailProgress?.Report(
+                            $"[{idx + 1}/{total}] Error en {Path.GetFileName(path)}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        var done = Interlocked.Increment(ref processed);
+                        var percent = (int)Math.Round(done * 80.0 / total);
+                        progress?.Report(percent);
+                    }
+                });
 
-                    if (collection.Count == 0)
-                        throw localFirstError ?? new InvalidOperationException("No se pudieron procesar las imágenes.");
+                if (pageBuffers.All(b => b == null))
+                    throw localFirstError ?? new InvalidOperationException("No se pudieron procesar las imágenes.");
 
-                    progress?.Report(-1);
+                progress?.Report(-1);
+                using (var collection = new MagickImageCollection())
+                {
+                    for (var i = 0; i < total; i++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var buffer = pageBuffers[i];
+                        if (buffer == null)
+                            throw localFirstError ?? new InvalidOperationException($"No se pudo procesar la imagen {i + 1}.");
+
+                        using (var page = new MagickImage(buffer))
+                        {
+                            collection.Add(page.Clone());
+                        }
+                    }
+
                     collection.Write(tempPath, MagickFormat.Pdf);
-                    progress?.Report(85);
                 }
+
+                progress?.Report(85);
 
                 var fi = new FileInfo(tempPath);
                 return fi.Exists ? fi.Length : 0;
