@@ -210,7 +210,6 @@ namespace opti_pdf
                             var readSettings = new MagickReadSettings
                             {
                                 ColorSpace = ColorSpace.sRGB,
-                                Density = new Density(requestedMaxDpi),
                                 FrameIndex = 0,
                                 FrameCount = 1
                             };
@@ -224,17 +223,16 @@ namespace opti_pdf
                                 if (srcDpi <= 0)
                                     srcDpi = 72;
 
-                                var targetDpi = gentle
-                                    ? (int)Math.Max(minDpi, srcDpi)
+                                var desiredDpi = gentle
+                                    ? requestedMaxDpi
                                     : Math.Max(minDpi, effectiveDpiParam - aggressiveness * 50);
+                                var targetDpi = (int)Math.Max(1, Math.Min(desiredDpi, srcDpi));
+                                var targetWasClamped = targetDpi < desiredDpi;
 
                                 double scale = 1.0;
-                                if (!gentle)
+                                if (!gentle && targetDpi < srcDpi)
                                 {
-                                    if (srcDpi > targetDpi)
-                                        scale = (double)targetDpi / srcDpi;
-                                    else if (srcDpi < targetDpi && (src.Width >= targetDpi || src.Height >= targetDpi))
-                                        scale = (double)targetDpi / srcDpi;
+                                    scale = (double)targetDpi / srcDpi;
                                 }
 
                                 var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
@@ -286,9 +284,12 @@ namespace opti_pdf
                                         var reductionPct = originalLength > 0
                                             ? (100.0 * (originalLength - newLength) / originalLength)
                                             : 0.0;
-                                        var aggressivenessLabel = gentle ? "suave" : aggressiveness.ToString();
+                                        var aggressivenessLabel = gentle
+                                            ? "Nivel 1 (suave)"
+                                            : $"Nivel {Math.Max(1, aggressiveness + 1)}";
+                                        var clampSuffix = targetWasClamped ? " (limitado por DPI de origen)" : string.Empty;
                                         detailProgress?.Report(
-                                            $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
+                                            $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi}{clampSuffix} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
                                     }
                                 }
                             }
