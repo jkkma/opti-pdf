@@ -1,0 +1,5 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Condition="Exists('$(FrameworkPathOverride)/Facades/netstandard.dll')">
+    <Reference Include="$(FrameworkPathOverride)/Facades/netstandard.dll" />
+  </ItemGroup>
+</Project>
