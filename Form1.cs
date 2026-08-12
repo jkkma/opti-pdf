@@ -1,4 +1,4 @@
-using ImageMagick;
+﻿using ImageMagick;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -66,9 +66,6 @@ namespace opti_pdf
                 progressBar.Visible = true;
                 lblStatus.Text = "Procesando...";
 
-                const int automaticQuality = 80;
-                const int automaticMaxDpi = 300;
-
                 var progress = new Progress<int>(p =>
                 {
                     var baseText = string.IsNullOrEmpty(_lastDetailStatus) ? "Procesando..." : _lastDetailStatus;
@@ -97,19 +94,12 @@ namespace opti_pdf
 
                 try
                 {
-                    await Task.Run(
-                        () => CreateOptimizedPdfWithImageMagick(
-                            dlg.FileName,
-                            automaticQuality,
-                            automaticMaxDpi,
-                            progress,
-                            detailProgress,
-                            _cts.Token),
+                    var pages = _pages.ToArray();
+                    var result = await Task.Run(
+                        () => PdfOptimizer.Create(pages, dlg.FileName, progress, detailProgress, _cts.Token),
                         _cts.Token);
 
-                    lblStatus.Text = "PDF creado exitosamente";
-                    if (!_closeRequested)
-                        MessageBox.Show("PDF creado exitosamente.", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    ReportResult(result);
                 }
                 catch (OperationCanceledException)
                 {
@@ -185,311 +175,43 @@ namespace opti_pdf
             }
         }
 
-        private void CreateOptimizedPdfWithImageMagick(
-            string outputPath,
-            int initialQuality,
-            int requestedMaxDpi,
-            IProgress<int> progress,
-            IProgress<string> detailProgress,
-            CancellationToken cancellationToken)
+        /// <summary>
+        /// Reports the outcome honestly: a PDF that could not be brought under
+        /// the cap is still saved, but is never announced as a plain success.
+        /// </summary>
+        private void ReportResult(OptimizationResult result)
         {
-            const long sizeLimitBytes = 5L * 1024 * 1024;
-            const int minDpi = 150;
-            const int minQuality = 40;
+            var sizeMb = result.SizeBytes / (1024.0 * 1024.0);
+            var limitMb = PdfOptimizer.SizeLimitBytes / (1024.0 * 1024.0);
 
-            if (_pages.Count == 0)
-                throw new InvalidOperationException("No hay imágenes para procesar.");
-
-            progress?.Report(0);
-
-            var effectiveDpi = Math.Max(requestedMaxDpi, 300);
-            var quality = Math.Max(minQuality, Math.Min(100, initialQuality));
-
-            var tempDir = Path.GetTempPath();
-            var tempFileBase = Path.Combine(tempDir, "opti_pdf_attempt_" + Guid.NewGuid().ToString("N"));
-            string bestTemp = null;
-            long bestSize = long.MaxValue;
-            var outputWritten = false;
-
-            void PromoteToOutput(string tempPath)
+            if (result.WithinLimit)
             {
-                if (string.IsNullOrEmpty(tempPath) || !File.Exists(tempPath))
-                    return;
+                lblStatus.Text = $"PDF creado exitosamente ({sizeMb:0.##} MB)";
 
-                if (File.Exists(outputPath))
-                    File.Delete(outputPath);
-
-                File.Move(tempPath, outputPath);
-                outputWritten = true;
-                progress?.Report(100);
-            }
-
-            long RunPdfPass(string tempPath, int effectiveDpiParam, int baseQuality, int aggressiveness, bool gentle)
-            {
-                var total = _pages.Count;
-                var processed = 0;
-                var options = new ParallelOptions
+                if (!_closeRequested)
                 {
-                    MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
-                    CancellationToken = cancellationToken
-                };
-                var localFirstError = default(Exception);
-                var pageBuffers = new byte[total][];
-
-                Parallel.For(0, total, options, idx =>
-                {
-                    options.CancellationToken.ThrowIfCancellationRequested();
-                    var page = _pages[idx];
-                    try
-                    {
-                        var readSettings = page.CreateReadSettings();
-                        readSettings.ColorSpace = ColorSpace.sRGB;
-                        var originalLength = new FileInfo(page.Path).Length;
-
-                        using (var src = new MagickImage(page.Path, readSettings))
-                        {
-                            var srcDpiX = src.Density?.X ?? 72;
-                            var srcDpiY = src.Density?.Y ?? 72;
-                            var srcDpi = Math.Max(srcDpiX, srcDpiY);
-                            if (srcDpi <= 0)
-                                srcDpi = 72;
-
-                            var desiredDpi = gentle
-                                ? requestedMaxDpi
-                                : Math.Max(minDpi, effectiveDpiParam - aggressiveness * 50);
-                            var targetDpi = (int)Math.Max(1, Math.Min(desiredDpi, srcDpi));
-                            var targetWasClamped = targetDpi < desiredDpi;
-
-                            double scale = 1.0;
-                            if (!gentle && targetDpi < srcDpi)
-                            {
-                                scale = (double)targetDpi / srcDpi;
-                            }
-
-                            var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
-                            var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
-
-                            using (var img = (MagickImage)src.Clone())
-                            {
-                                if (!gentle && (scale < 0.999 || scale > 1.001))
-                                {
-                                    img.FilterType = FilterType.Cubic;
-                                    img.Resize((uint)newWidth, (uint)newHeight);
-                                }
-
-                                if (gentle)
-                                {
-                                    img.Strip();
-                                    img.ColorSpace = ColorSpace.sRGB;
-                                    img.Density = new Density(targetDpi);
-                                    img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
-                                    img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
-                                    img.Quality = (uint)baseQuality;
-                                }
-                                else
-                                {
-                                    var attemptQuality = Math.Max(minQuality, baseQuality - aggressiveness * 12);
-                                    ApplyLegalOptimizations(img, attemptQuality, targetDpi, aggressiveness);
-                                }
-
-                                using (var ms = new MemoryStream())
-                                {
-                                    img.Format = MagickFormat.Jpeg;
-                                    img.Write(ms);
-                                    pageBuffers[idx] = ms.ToArray();
-
-                                    var newLength = ms.Length;
-                                    var reductionPct = originalLength > 0
-                                        ? (100.0 * (originalLength - newLength) / originalLength)
-                                        : 0.0;
-                                    var aggressivenessLabel = gentle
-                                        ? "Nivel 0 (suave)"
-                                        : $"Nivel {Math.Max(1, aggressiveness + 1)}";
-                                    var clampSuffix = targetWasClamped ? " (limitado por DPI de origen)" : string.Empty;
-                                    detailProgress?.Report(
-                                        $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {page.DisplayName} - DPI {srcDpi:0}->{targetDpi}{clampSuffix} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Interlocked.CompareExchange(ref localFirstError, ex, null);
-                        AppLog.Error($"Imagen {page.DisplayName}", ex);
-                        detailProgress?.Report(
-                            $"[{idx + 1}/{total}] Error en {page.DisplayName}: {ex.Message}");
-                    }
-                    finally
-                    {
-                        var done = Interlocked.Increment(ref processed);
-                        var percent = (int)Math.Round(done * 80.0 / total);
-                        progress?.Report(percent);
-                    }
-                });
-
-                if (pageBuffers.All(b => b == null))
-                    throw localFirstError ?? new InvalidOperationException("No se pudieron procesar las imágenes.");
-
-                progress?.Report(-1);
-                using (var collection = new MagickImageCollection())
-                {
-                    for (var i = 0; i < total; i++)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        var buffer = pageBuffers[i];
-                        if (buffer == null)
-                            throw localFirstError ?? new InvalidOperationException($"No se pudo procesar la imagen {i + 1}.");
-
-                        using (var page = new MagickImage(buffer))
-                        {
-                            collection.Add(page.Clone());
-                        }
-                    }
-
-                    collection.Write(tempPath, MagickFormat.Pdf);
+                    MessageBox.Show(
+                        $"PDF creado exitosamente.{Environment.NewLine}Tamaño final: {sizeMb:0.##} MB.",
+                        "Opti-PDF",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
                 }
 
-                progress?.Report(85);
-
-                var fi = new FileInfo(tempPath);
-                return fi.Exists ? fi.Length : 0;
+                return;
             }
 
-            try
+            lblStatus.Text = $"PDF creado, pero supera el límite ({sizeMb:0.##} MB)";
+
+            if (!_closeRequested)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // First gentle pass
-                var gentleTemp = tempFileBase + "_gentle.pdf";
-                var gentleSize = RunPdfPass(gentleTemp, Math.Max(minDpi, requestedMaxDpi), quality, 0, true);
-                bestTemp = gentleTemp;
-                bestSize = gentleSize;
-
-                if (bestSize <= sizeLimitBytes)
-                {
-                    PromoteToOutput(bestTemp);
-                    return;
-                }
-
-                // Quality search at current DPI (find highest quality that fits)
-                var lowQ = minQuality;
-                var highQ = quality;
-                while (lowQ <= highQ && bestSize > sizeLimitBytes)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    var midQ = (lowQ + highQ) / 2;
-                    var attemptTemp = tempFileBase + $"_q{midQ}.pdf";
-                    var attemptSize = RunPdfPass(attemptTemp, effectiveDpi, midQ, 0, false);
-
-                    if (attemptSize <= sizeLimitBytes)
-                    {
-                        // Fits: keep as best and try higher quality
-                        if (attemptSize < bestSize)
-                        {
-                            if (!string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
-                                File.Delete(bestTemp);
-
-                            bestTemp = attemptTemp;
-                            bestSize = attemptSize;
-                        }
-                        else if (File.Exists(attemptTemp))
-                        {
-                            File.Delete(attemptTemp);
-                        }
-
-                        lowQ = midQ + 1;
-                    }
-                    else
-                    {
-                        // Too big: try lower quality
-                        if (File.Exists(attemptTemp))
-                            File.Delete(attemptTemp);
-
-                        highQ = midQ - 1;
-                    }
-                }
-
-                if (bestSize <= sizeLimitBytes)
-                {
-                    PromoteToOutput(bestTemp);
-                    bestTemp = null;
-                    return;
-                }
-
-                // Progressive optimizations only if still over 5 MB
-                for (var aggressiveness = 0; aggressiveness < 4 && bestSize > sizeLimitBytes; aggressiveness++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    var attemptTemp = tempFileBase + $"_{aggressiveness + 1}.pdf";
-                    var attemptSize = RunPdfPass(attemptTemp, effectiveDpi, quality, aggressiveness, false);
-
-                    if (attemptSize < bestSize)
-                    {
-                        if (!string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
-                            File.Delete(bestTemp);
-
-                        bestTemp = attemptTemp;
-                        bestSize = attemptSize;
-                    }
-                    else if (File.Exists(attemptTemp))
-                    {
-                        File.Delete(attemptTemp);
-                    }
-
-                    if (bestSize <= sizeLimitBytes)
-                    {
-                        PromoteToOutput(bestTemp);
-                        bestTemp = null;
-                        return;
-                    }
-
-                    quality = Math.Max(minQuality, quality - 8);
-                    progress?.Report(Math.Min(95, 80 + aggressiveness * 5));
-                }
+                MessageBox.Show(
+                    $"No fue posible bajar de {limitMb:0.##} MB sin cruzar los límites de calidad "
+                        + $"(calidad {PdfOptimizer.MinQuality}, {PdfOptimizer.MinDpi} PPP)."
+                        + $"{Environment.NewLine}Se guardó la mejor versión obtenida: {sizeMb:0.##} MB.",
+                    "Opti-PDF",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
             }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                AppLog.Error("CreateOptimizedPdfWithImageMagick", ex);
-                throw new InvalidOperationException("Fallo al crear el PDF.", ex);
-            }
-            finally
-            {
-                if (!outputWritten && !string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
-                {
-                    PromoteToOutput(bestTemp);
-                }
-            }
-        }
-
-        private static void ApplyLegalOptimizations(MagickImage img, int jpegQuality, int targetDpi, int aggressiveness)
-        {
-            img.Strip();
-            img.ColorSpace = ColorSpace.sRGB;
-
-            if (aggressiveness >= 2)
-            {
-                try { img.AutoLevel(); } catch { }
-                try { img.Normalize(); } catch { }
-                for (var i = 0; i < 1 + aggressiveness; i++)
-                {
-                    try { img.Despeckle(); } catch { }
-                }
-            }
-            else
-            {
-                try { img.Despeckle(); } catch { }
-            }
-
-            img.Density = new Density(targetDpi);
-            img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
-            img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
-            img.Quality = (uint)jpegQuality;
         }
 
         private void BtnAdd_Click(object sender, EventArgs e)

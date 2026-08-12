@@ -1,0 +1,490 @@
+﻿using ImageMagick;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace opti_pdf
+{
+    internal sealed class OptimizationResult
+    {
+        public long SizeBytes { get; set; }
+
+        public bool WithinLimit { get; set; }
+    }
+
+    /// <summary>
+    /// Builds a size-constrained PDF from a list of pages.
+    ///
+    /// Two ideas drive the design. First, resolution is expressed relative to
+    /// the output page, not to the DPI recorded in the source metadata: that
+    /// field is absent or wrong on most images, and keying off it meant
+    /// downscaling silently never happened for anything tagged 72 DPI.
+    /// Second, the byte budget is split across pages up front, so one large
+    /// photo is squeezed instead of dragging every other page down with it.
+    /// </summary>
+    internal static class PdfOptimizer
+    {
+        public const long SizeLimitBytes = 5L * 1024 * 1024;
+        public const int MinQuality = 40;
+        public const int MaxQuality = 80;
+        public const int MinDpi = 150;
+        public const int MaxDpi = 300;
+
+        private const int MaxParallelism = 4;
+        private const int QualityStep = 8;
+        private const int MaxBudgetRounds = 3;
+        private const int MaxDownscaleSteps = 4;
+        private const double DownscaleStep = 0.8;
+        private const long MinPageBudgetBytes = 16L * 1024;
+
+        // Pages are normalised to fit an A4 box so a batch of mixed sources
+        // produces consistent page sizes instead of pages measured in feet.
+        private const double PageLongEdgeInches = 11.69;
+        private const double PageShortEdgeInches = 8.27;
+
+        // Progress bands per round. They never overlap, so the bar only ever
+        // moves forward even though a job may need several rounds.
+        private static readonly int[] ProgressBands = { 0, 55, 75, 88, 96 };
+
+        public static OptimizationResult Create(
+            IReadOnlyList<PageSource> pages,
+            string outputPath,
+            IProgress<int> progress,
+            IProgress<string> detail,
+            CancellationToken cancellationToken)
+        {
+            if (pages == null || pages.Count == 0)
+                throw new InvalidOperationException("No hay imágenes para procesar.");
+
+            var tempBase = Path.Combine(Path.GetTempPath(), "opti_pdf_attempt_" + Guid.NewGuid().ToString("N"));
+            var temps = new List<string>();
+            string bestTemp = null;
+            string promoted = null;
+            long bestSize = long.MaxValue;
+
+            try
+            {
+                progress?.Report(0);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var weights = MeasureWeights(pages, cancellationToken);
+                var factor = 0.0;
+
+                for (var round = 0; round <= MaxBudgetRounds; round++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Round 0 is the gentle pass: best quality, resolution
+                    // capped to the page. Most jobs finish here in one pass.
+                    var budgets = round == 0
+                        ? Enumerable.Repeat(long.MaxValue, pages.Count).ToArray()
+                        : AllocateBudgets(weights, (long)(SizeLimitBytes * factor));
+
+                    var temp = tempBase + "_r" + round + ".pdf";
+                    temps.Add(temp);
+
+                    var size = BuildPdf(pages, budgets, temp, round, progress, detail, cancellationToken);
+
+                    if (size > 0 && size < bestSize)
+                    {
+                        bestTemp = temp;
+                        bestSize = size;
+                    }
+
+                    if (bestSize <= SizeLimitBytes)
+                        break;
+
+                    // Correct from what the last round actually measured
+                    // rather than stepping down by a fixed guess.
+                    factor = round == 0
+                        ? 0.90
+                        : Math.Max(0.25, factor * ((double)SizeLimitBytes / Math.Max(1L, size)) * 0.95);
+                }
+
+                if (string.IsNullOrEmpty(bestTemp) || !File.Exists(bestTemp))
+                    throw new InvalidOperationException("No se pudo generar el PDF.");
+
+                Promote(bestTemp, outputPath);
+                promoted = bestTemp;
+            }
+            catch (OperationCanceledException)
+            {
+                // A cancelled run leaves nothing at the destination.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("PdfOptimizer.Create", ex);
+
+                // A failed run still hands over the best attempt it managed
+                // to build, but must not hide the promotion failing too.
+                if (promoted == null && !string.IsNullOrEmpty(bestTemp) && File.Exists(bestTemp))
+                {
+                    try
+                    {
+                        Promote(bestTemp, outputPath);
+                        promoted = bestTemp;
+                    }
+                    catch (Exception promoteError)
+                    {
+                        AppLog.Error("Promoción del mejor intento", promoteError);
+                    }
+                }
+
+                throw new InvalidOperationException("Fallo al crear el PDF.", ex);
+            }
+            finally
+            {
+                foreach (var temp in temps)
+                {
+                    if (string.Equals(temp, promoted, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    try
+                    {
+                        if (File.Exists(temp))
+                            File.Delete(temp);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.Error("Limpieza de temporales", ex);
+                    }
+                }
+            }
+
+            progress?.Report(100);
+            return new OptimizationResult
+            {
+                SizeBytes = bestSize,
+                WithinLimit = bestSize <= SizeLimitBytes
+            };
+        }
+
+        private static void Promote(string tempPath, string outputPath)
+        {
+            if (File.Exists(outputPath))
+                File.Delete(outputPath);
+
+            File.Move(tempPath, outputPath);
+        }
+
+        /// <summary>
+        /// Header-only pass that yields each page's capped pixel count, used
+        /// to weight the byte budget. Runs once for the whole job.
+        /// </summary>
+        private static long[] MeasureWeights(IReadOnlyList<PageSource> pages, CancellationToken cancellationToken)
+        {
+            var weights = new long[pages.Count];
+            var options = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Max(1, Math.Min(MaxParallelism, Environment.ProcessorCount)),
+                CancellationToken = cancellationToken
+            };
+
+            Parallel.For(0, pages.Count, options, i =>
+            {
+                try
+                {
+                    using (var probe = new MagickImage())
+                    {
+                        probe.Ping(pages[i].Path, pages[i].CreateReadSettings());
+
+                        uint width, height;
+                        FitToPage(probe.Width, probe.Height, MaxDpi, out width, out height);
+                        weights[i] = (long)width * height;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error($"Ping {pages[i].DisplayName}", ex);
+                    weights[i] = 0;
+                }
+            });
+
+            return weights;
+        }
+
+        private static long[] AllocateBudgets(long[] weights, long totalBudget)
+        {
+            var budgets = new long[weights.Length];
+            var sum = weights.Sum();
+
+            for (var i = 0; i < weights.Length; i++)
+            {
+                var share = sum > 0 ? (double)weights[i] / sum : 1.0 / weights.Length;
+                budgets[i] = Math.Max(MinPageBudgetBytes, (long)(totalBudget * share));
+            }
+
+            return budgets;
+        }
+
+        private static long BuildPdf(
+            IReadOnlyList<PageSource> pages,
+            long[] budgets,
+            string tempPath,
+            int round,
+            IProgress<int> progress,
+            IProgress<string> detail,
+            CancellationToken cancellationToken)
+        {
+            var total = pages.Count;
+            var outputs = new PageOutput[total];
+            var processed = 0;
+            Exception firstError = null;
+
+            var options = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Max(1, Math.Min(MaxParallelism, Environment.ProcessorCount)),
+                CancellationToken = cancellationToken
+            };
+
+            Parallel.For(0, total, options, i =>
+            {
+                try
+                {
+                    outputs[i] = ProcessPage(pages[i], budgets[i], cancellationToken);
+                    detail?.Report(Describe(pages[i], outputs[i], i, total, round));
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.CompareExchange(ref firstError, ex, null);
+                    AppLog.Error($"Página {pages[i].DisplayName}", ex);
+                    detail?.Report($"[{i + 1}/{total}] Error en {pages[i].DisplayName}: {ex.Message}");
+                }
+                finally
+                {
+                    var done = Interlocked.Increment(ref processed);
+                    progress?.Report(ProgressFor(round, done, total));
+                }
+            });
+
+            // PDF assembly is single-threaded by design.
+            progress?.Report(-1);
+
+            using (var collection = new MagickImageCollection())
+            {
+                for (var i = 0; i < total; i++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var output = outputs[i];
+                    if (output?.Buffer == null)
+                        throw firstError ?? new InvalidOperationException($"No se pudo procesar la página {i + 1}.");
+
+                    var page = new MagickImage(output.Buffer);
+
+                    // Encoder settings live on the settings object, not on the
+                    // pixels, so they do not survive the round trip through a
+                    // buffer and have to be restated before the PDF is written.
+                    page.Quality = (uint)output.Quality;
+                    page.Settings.Compression = CompressionMethod.JPEG;
+                    page.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
+                    page.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+
+                    // The collection takes ownership and disposes its items.
+                    collection.Add(page);
+                }
+
+                collection.Write(tempPath, MagickFormat.Pdf);
+            }
+
+            var info = new FileInfo(tempPath);
+            return info.Exists ? info.Length : 0;
+        }
+
+        private static PageOutput ProcessPage(PageSource source, long budgetBytes, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            using (var img = new MagickImage(source.Path, source.CreateReadSettings()))
+            {
+                Prepare(img);
+
+                uint maxWidth, maxHeight, minWidth, minHeight;
+                FitToPage(img.Width, img.Height, MaxDpi, out maxWidth, out maxHeight);
+                FitToPage(img.Width, img.Height, MinDpi, out minWidth, out minHeight);
+
+                img.FilterType = FilterType.Cubic;
+                if (maxWidth < img.Width || maxHeight < img.Height)
+                    img.Resize(maxWidth, maxHeight);
+
+                ApplyPageDensity(img);
+
+                byte[] smallest = null;
+                var smallestQuality = MinQuality;
+
+                for (var step = 0; step <= MaxDownscaleSteps; step++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Descending ladder: the first quality that fits is the
+                    // highest quality that fits, so a page that comfortably
+                    // meets its budget costs exactly one encode.
+                    for (var quality = MaxQuality; quality >= MinQuality; quality -= QualityStep)
+                    {
+                        var buffer = Encode(img, quality);
+
+                        if (buffer.Length <= budgetBytes)
+                            return NewOutput(img, buffer, quality);
+
+                        if (smallest == null || buffer.Length < smallest.Length)
+                        {
+                            smallest = buffer;
+                            smallestQuality = quality;
+                        }
+                    }
+
+                    // Quality alone was not enough. Drop resolution, but never
+                    // below the floor of MinDpi on the page.
+                    var nextWidth = (uint)Math.Max(1, Math.Round(img.Width * DownscaleStep));
+                    var nextHeight = (uint)Math.Max(1, Math.Round(img.Height * DownscaleStep));
+                    if (nextWidth < minWidth || nextHeight < minHeight)
+                        break;
+
+                    img.Resize(nextWidth, nextHeight);
+                    ApplyPageDensity(img);
+                }
+
+                // Both floors reached and still over budget: hand back the
+                // smallest attempt. The caller tightens and rebuilds.
+                return NewOutput(img, smallest ?? Encode(img, MinQuality), smallestQuality);
+            }
+        }
+
+        private static PageOutput NewOutput(MagickImage img, byte[] buffer, int quality)
+        {
+            return new PageOutput
+            {
+                Buffer = buffer,
+                Quality = quality,
+                Width = img.Width,
+                Height = img.Height,
+                Density = PageDensity(img.Width, img.Height)
+            };
+        }
+
+        private static void Prepare(MagickImage img)
+        {
+            // Orientation has to be baked into the pixels: Strip() drops the
+            // EXIF tag and PDF has no orientation field, so a rotated phone
+            // photo would otherwise land in the document sideways forever.
+            img.AutoOrient();
+
+            // Convert through the source profile while it is still attached.
+            // Stripping first and then asserting sRGB reinterprets the numbers
+            // instead of converting them, which shifts every wide-gamut image.
+            if (img.GetColorProfile() != null)
+            {
+                try
+                {
+                    img.TransformColorSpace(ColorProfiles.SRGB);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("TransformColorSpace", ex);
+                    img.ColorSpace = ColorSpace.sRGB;
+                }
+            }
+            else
+            {
+                img.ColorSpace = ColorSpace.sRGB;
+            }
+
+            // JPEG carries no alpha channel: flatten explicitly rather than
+            // leaving the background to whatever the encoder happens to pick.
+            if (img.HasAlpha)
+            {
+                img.BackgroundColor = MagickColors.White;
+                img.Alpha(AlphaOption.Remove);
+            }
+
+            img.Strip();
+        }
+
+        private static byte[] Encode(MagickImage img, int quality)
+        {
+            img.Format = MagickFormat.Jpeg;
+            img.Quality = (uint)quality;
+            img.Settings.Compression = CompressionMethod.JPEG;
+            img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
+            img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+
+            using (var ms = new MemoryStream())
+            {
+                img.Write(ms);
+                return ms.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Scales <paramref name="width"/> x <paramref name="height"/> down to
+        /// what <paramref name="dpi"/> is worth on the output page. Never
+        /// upscales, so a small source keeps its own pixels.
+        /// </summary>
+        private static void FitToPage(uint width, uint height, int dpi, out uint fitWidth, out uint fitHeight)
+        {
+            double longPixels = Math.Max(width, height);
+            double shortPixels = Math.Min(width, height);
+
+            var scale = Math.Min(
+                1.0,
+                Math.Min(dpi * PageLongEdgeInches / longPixels, dpi * PageShortEdgeInches / shortPixels));
+
+            fitWidth = (uint)Math.Max(1, Math.Round(width * scale));
+            fitHeight = (uint)Math.Max(1, Math.Round(height * scale));
+        }
+
+        /// <summary>Density that makes the image exactly fill the page box.</summary>
+        private static double PageDensity(uint width, uint height)
+        {
+            double longPixels = Math.Max(width, height);
+            double shortPixels = Math.Min(width, height);
+
+            return Math.Max(longPixels / PageLongEdgeInches, shortPixels / PageShortEdgeInches);
+        }
+
+        private static void ApplyPageDensity(MagickImage img)
+        {
+            var density = PageDensity(img.Width, img.Height);
+            img.Density = new Density(density, density, DensityUnit.PixelsPerInch);
+        }
+
+        private static int ProgressFor(int round, int done, int total)
+        {
+            var index = Math.Max(0, Math.Min(round, ProgressBands.Length - 2));
+            var low = ProgressBands[index];
+            var high = ProgressBands[index + 1];
+
+            return low + (int)Math.Round((high - low) * done / (double)Math.Max(1, total));
+        }
+
+        private static string Describe(PageSource source, PageOutput output, int index, int total, int round)
+        {
+            var stage = round == 0 ? "Calidad máxima" : $"Ajuste {round}";
+
+            return $"[{index + 1}/{total}] {stage} - {source.DisplayName} - "
+                 + $"{output.Width}x{output.Height} @ {output.Density:0} PPP - "
+                 + $"calidad {output.Quality} - {output.Buffer.Length / 1024.0:0.#} KB";
+        }
+
+        private sealed class PageOutput
+        {
+            public byte[] Buffer { get; set; }
+
+            public int Quality { get; set; }
+
+            public uint Width { get; set; }
+
+            public uint Height { get; set; }
+
+            public double Density { get; set; }
+        }
+    }
+}
