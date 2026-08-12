@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash scripts/linux-build.sh)",
+      "Bash(dotnet msbuild:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/protect-generated.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check-build.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
