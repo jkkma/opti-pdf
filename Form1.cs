@@ -1,4 +1,4 @@
-﻿using ImageMagick;
+using ImageMagick;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -12,11 +12,10 @@ namespace opti_pdf
 {
     public partial class Form1 : Form
     {
-        private readonly List<string> _imageFiles = new List<string>();
+        private readonly List<PageSource> _pages = new List<PageSource>();
         private CancellationTokenSource _cts;
         private string _lastDetailStatus = "LISTO";
-
-        private static readonly object _logSync = new object();
+        private bool _closeRequested;
 
         public Form1()
         {
@@ -31,6 +30,7 @@ namespace opti_pdf
             this.AllowDrop = true;
             this.DragEnter += Form1_DragEnter;
             this.DragDrop += Form1_DragDrop;
+            this.FormClosing += Form1_FormClosing;
 
             lvImages.AllowDrop = true;
             lvImages.DragEnter += Form1_DragEnter;
@@ -38,9 +38,14 @@ namespace opti_pdf
             lvImages.View = View.LargeIcon;
         }
 
+        private bool IsBusy
+        {
+            get { return _cts != null; }
+        }
+
         private async void BtnCreate_Click(object sender, EventArgs e)
         {
-            if (_imageFiles.Count == 0)
+            if (_pages.Count == 0)
             {
                 MessageBox.Show("No se han agregado imágenes.", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
@@ -56,11 +61,7 @@ namespace opti_pdf
 
                 _cts = new CancellationTokenSource();
                 _lastDetailStatus = "Procesando...";
-                btnCreate.Enabled = false;
-                btnAdd.Enabled = false;
-                btnRemove.Enabled = false;
-                btnClear.Enabled = false;
-                btnCancel.Enabled = true;
+                SetInputEnabled(false);
                 progressBar.Value = 0;
                 progressBar.Visible = true;
                 lblStatus.Text = "Procesando...";
@@ -107,7 +108,8 @@ namespace opti_pdf
                         _cts.Token);
 
                     lblStatus.Text = "PDF creado exitosamente";
-                    MessageBox.Show("PDF creado exitosamente.", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (!_closeRequested)
+                        MessageBox.Show("PDF creado exitosamente.", "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 catch (OperationCanceledException)
                 {
@@ -115,10 +117,11 @@ namespace opti_pdf
                 }
                 catch (Exception ex)
                 {
-                    LogError("BtnCreate_Click", ex);
+                    AppLog.Error("BtnCreate_Click", ex);
                     var message = $"Error al crear PDF: {ex.GetBaseException()?.Message ?? ex.Message}";
                     SetStatus("Error al crear PDF");
-                    MessageBox.Show(message, "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    if (!_closeRequested)
+                        MessageBox.Show(message, "Opti-PDF", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally
                 {
@@ -126,14 +129,12 @@ namespace opti_pdf
                     progressBar.MarqueeAnimationSpeed = 0;
                     progressBar.Style = ProgressBarStyle.Continuous;
 
-                    btnCreate.Enabled = true;
-                    btnAdd.Enabled = true;
-                    btnRemove.Enabled = true;
-                    btnClear.Enabled = true;
-                    btnCancel.Enabled = false;
-
                     _cts?.Dispose();
                     _cts = null;
+                    SetInputEnabled(true);
+
+                    if (_closeRequested)
+                        Close();
                 }
             }
         }
@@ -145,6 +146,42 @@ namespace opti_pdf
                 lblStatus.Text = "Cancelando...";
                 _cts.Cancel();
                 btnCancel.Enabled = false;
+            }
+        }
+
+        /// <summary>
+        /// Enables or disables every route into <see cref="_pages"/>.
+        /// Drag-and-drop is included: the worker iterates the list from a
+        /// background thread and List&lt;T&gt; is not thread-safe, so a drop
+        /// during conversion would race the pipeline.
+        /// </summary>
+        private void SetInputEnabled(bool enabled)
+        {
+            btnCreate.Enabled = enabled;
+            btnAdd.Enabled = enabled;
+            btnRemove.Enabled = enabled;
+            btnClear.Enabled = enabled;
+            btnCancel.Enabled = !enabled;
+
+            AllowDrop = enabled;
+            lvImages.AllowDrop = enabled;
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (!IsBusy)
+                return;
+
+            // Never leave the worker running against a disposed form: cancel
+            // it and close once BtnCreate_Click has unwound.
+            e.Cancel = true;
+            _closeRequested = true;
+
+            if (!_cts.IsCancellationRequested)
+            {
+                _cts.Cancel();
+                btnCancel.Enabled = false;
+                lblStatus.Text = "Cancelando...";
             }
         }
 
@@ -160,7 +197,7 @@ namespace opti_pdf
             const int minDpi = 150;
             const int minQuality = 40;
 
-            if (_imageFiles.Count == 0)
+            if (_pages.Count == 0)
                 throw new InvalidOperationException("No hay imágenes para procesar.");
 
             progress?.Report(0);
@@ -189,7 +226,7 @@ namespace opti_pdf
 
             long RunPdfPass(string tempPath, int effectiveDpiParam, int baseQuality, int aggressiveness, bool gentle)
             {
-                var total = _imageFiles.Count;
+                var total = _pages.Count;
                 var processed = 0;
                 var options = new ParallelOptions
                 {
@@ -202,18 +239,14 @@ namespace opti_pdf
                 Parallel.For(0, total, options, idx =>
                 {
                     options.CancellationToken.ThrowIfCancellationRequested();
-                    var path = _imageFiles[idx];
+                    var page = _pages[idx];
                     try
                     {
-                        var readSettings = new MagickReadSettings
-                        {
-                            ColorSpace = ColorSpace.sRGB,
-                            FrameIndex = 0,
-                            FrameCount = 1
-                        };
-                        var originalLength = new FileInfo(path).Length;
+                        var readSettings = page.CreateReadSettings();
+                        readSettings.ColorSpace = ColorSpace.sRGB;
+                        var originalLength = new FileInfo(page.Path).Length;
 
-                        using (var src = new MagickImage(path, readSettings))
+                        using (var src = new MagickImage(page.Path, readSettings))
                         {
                             var srcDpiX = src.Density?.X ?? 72;
                             var srcDpiY = src.Density?.Y ?? 72;
@@ -236,7 +269,7 @@ namespace opti_pdf
                             var newWidth = (int)Math.Max(1, Math.Round(src.Width * scale));
                             var newHeight = (int)Math.Max(1, Math.Round(src.Height * scale));
 
-                            using (var img = src.Clone())
+                            using (var img = (MagickImage)src.Clone())
                             {
                                 if (!gentle && (scale < 0.999 || scale > 1.001))
                                 {
@@ -252,12 +285,11 @@ namespace opti_pdf
                                     img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
                                     img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
                                     img.Quality = (uint)baseQuality;
-                                    img.FilterType = FilterType.Cubic;
                                 }
                                 else
                                 {
                                     var attemptQuality = Math.Max(minQuality, baseQuality - aggressiveness * 12);
-                                    ApplyLegalOptimizations((MagickImage)img, attemptQuality, targetDpi, aggressiveness);
+                                    ApplyLegalOptimizations(img, attemptQuality, targetDpi, aggressiveness);
                                 }
 
                                 using (var ms = new MemoryStream())
@@ -275,7 +307,7 @@ namespace opti_pdf
                                         : $"Nivel {Math.Max(1, aggressiveness + 1)}";
                                     var clampSuffix = targetWasClamped ? " (limitado por DPI de origen)" : string.Empty;
                                     detailProgress?.Report(
-                                        $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {Path.GetFileName(path)} - DPI {srcDpi:0}->{targetDpi}{clampSuffix} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
+                                        $"[{idx + 1}/{total}] Agresividad: {aggressivenessLabel} - {page.DisplayName} - DPI {srcDpi:0}->{targetDpi}{clampSuffix} - {originalLength / 1024.0:0.#}KB -> {newLength / 1024.0:0.#}KB ({reductionPct:0.#}% ahorro)");
                                 }
                             }
                         }
@@ -283,9 +315,9 @@ namespace opti_pdf
                     catch (Exception ex)
                     {
                         Interlocked.CompareExchange(ref localFirstError, ex, null);
-                        LogError($"Imagen {Path.GetFileName(path)}", ex);
+                        AppLog.Error($"Imagen {page.DisplayName}", ex);
                         detailProgress?.Report(
-                            $"[{idx + 1}/{total}] Error en {Path.GetFileName(path)}: {ex.Message}");
+                            $"[{idx + 1}/{total}] Error en {page.DisplayName}: {ex.Message}");
                     }
                     finally
                     {
@@ -423,7 +455,7 @@ namespace opti_pdf
             }
             catch (Exception ex)
             {
-                LogError("CreateOptimizedPdfWithImageMagick", ex);
+                AppLog.Error("CreateOptimizedPdfWithImageMagick", ex);
                 throw new InvalidOperationException("Fallo al crear el PDF.", ex);
             }
             finally
@@ -458,7 +490,6 @@ namespace opti_pdf
             img.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
             img.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
             img.Quality = (uint)jpegQuality;
-            img.FilterType = FilterType.Cubic;
         }
 
         private void BtnAdd_Click(object sender, EventArgs e)
@@ -479,14 +510,14 @@ namespace opti_pdf
             var items = lvImages.SelectedItems.Cast<ListViewItem>().ToArray();
             foreach (var it in items)
             {
-                var path = it.Tag as string;
-                if (!string.IsNullOrEmpty(path))
+                var key = it.Tag as string;
+                if (!string.IsNullOrEmpty(key))
                 {
-                    _imageFiles.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase));
-                    if (imgListSmall.Images.ContainsKey(path))
-                        imgListSmall.Images.RemoveByKey(path);
-                    if (imgListLarge.Images.ContainsKey(path))
-                        imgListLarge.Images.RemoveByKey(path);
+                    _pages.RemoveAll(p => string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase));
+                    if (imgListSmall.Images.ContainsKey(key))
+                        imgListSmall.Images.RemoveByKey(key);
+                    if (imgListLarge.Images.ContainsKey(key))
+                        imgListLarge.Images.RemoveByKey(key);
                 }
 
                 lvImages.Items.Remove(it);
@@ -497,7 +528,7 @@ namespace opti_pdf
 
         private void BtnClear_Click(object sender, EventArgs e)
         {
-            _imageFiles.Clear();
+            _pages.Clear();
             lvImages.Items.Clear();
             imgListSmall.Images.Clear();
             imgListLarge.Images.Clear();
@@ -506,7 +537,7 @@ namespace opti_pdf
 
         private void Form1_DragEnter(object sender, DragEventArgs e)
         {
-            if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+            if (!IsBusy && e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
                 e.Effect = DragDropEffects.Copy;
             else
                 e.Effect = DragDropEffects.None;
@@ -514,7 +545,7 @@ namespace opti_pdf
 
         private void Form1_DragDrop(object sender, DragEventArgs e)
         {
-            if (e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop))
+            if (IsBusy || e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop))
                 return;
 
             var files = (string[])e.Data.GetData(DataFormats.FileDrop);
@@ -531,56 +562,87 @@ namespace opti_pdf
         private void AddFiles(IEnumerable<string> files)
         {
             var added = 0;
+
             foreach (var file in files)
             {
                 if (string.IsNullOrWhiteSpace(file))
                     continue;
 
-                if (_imageFiles.Contains(file, StringComparer.OrdinalIgnoreCase))
-                    continue;
-
+                IEnumerable<PageSource> pages;
                 try
                 {
-                    using (var original = new MagickImage(file))
-                    {
-                        using (var small = original.Clone())
-                        using (var large = original.Clone())
-                        {
-                            small.Resize((uint)imgListSmall.ImageSize.Width, (uint)imgListSmall.ImageSize.Height);
-                            large.Resize((uint)imgListLarge.ImageSize.Width, (uint)imgListLarge.ImageSize.Height);
-                            using (var ms = new MemoryStream())
-                            {
-                                small.Write(ms, MagickFormat.Bmp);
-                                ms.Position = 0;
-                                imgListSmall.Images.Add(file, new Bitmap(ms));
-                            }
-                            using (var ms = new MemoryStream())
-                            {
-                                large.Write(ms, MagickFormat.Bmp);
-                                ms.Position = 0;
-                                imgListLarge.Images.Add(file, new Bitmap(ms));
-                            }
-                        }
-                    }
-
-                    var item = new ListViewItem
-                    {
-                        Text = Path.GetFileName(file),
-                        ImageKey = file,
-                        Tag = file
-                    };
-
-                    lvImages.Items.Add(item);
-                    _imageFiles.Add(file);
-                    added++;
+                    pages = PageSource.FromFile(file);
                 }
                 catch (Exception ex)
                 {
-                    lblStatus.Text = $"Advertencia: no se pudo cargar {Path.GetFileName(file)} ({ex.Message})";
+                    AppLog.Error($"Enumerar {Path.GetFileName(file)}", ex);
+                    lblStatus.Text = $"Advertencia: no se pudo leer {Path.GetFileName(file)} ({ex.Message})";
+                    continue;
+                }
+
+                foreach (var page in pages)
+                {
+                    if (_pages.Any(p => string.Equals(p.Key, page.Key, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+
+                    try
+                    {
+                        AddThumbnails(page);
+
+                        var item = new ListViewItem
+                        {
+                            Text = page.DisplayName,
+                            ImageKey = page.Key,
+                            Tag = page.Key
+                        };
+
+                        lvImages.Items.Add(item);
+                        _pages.Add(page);
+                        added++;
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.Error($"Miniatura {page.DisplayName}", ex);
+                        lblStatus.Text = $"Advertencia: no se pudo cargar {page.DisplayName} ({ex.Message})";
+                    }
                 }
             }
 
-            lblStatus.Text = $"Se agregaron {added} imagen(es)";
+            lblStatus.Text = $"Se agregaron {added} página(s)";
+        }
+
+        private void AddThumbnails(PageSource page)
+        {
+            using (var original = new MagickImage(page.Path, page.CreateReadSettings()))
+            {
+                // Match what the output will look like: without this the
+                // thumbnail of a rotated phone photo disagrees with the page.
+                original.AutoOrient();
+
+                AddThumbnail(imgListSmall, original, page.Key);
+                AddThumbnail(imgListLarge, original, page.Key);
+            }
+        }
+
+        private static void AddThumbnail(ImageList list, MagickImage source, string key)
+        {
+            using (var thumb = (MagickImage)source.Clone())
+            {
+                thumb.Resize((uint)list.ImageSize.Width, (uint)list.ImageSize.Height);
+
+                using (var ms = new MemoryStream())
+                {
+                    thumb.Write(ms, MagickFormat.Bmp);
+                    ms.Position = 0;
+
+                    // ImageList copies the bitmap into its own handle, so the
+                    // temporary has to be disposed here or it leaks a GDI object.
+                    using (var bmp = new Bitmap(ms))
+                    {
+                        list.Images.Add(key, bmp);
+                    }
+                }
+            }
         }
 
         private void Form1_Load(object sender, EventArgs e)
@@ -602,23 +664,6 @@ namespace opti_pdf
             }
 
             lblStatus.Text = text;
-        }
-
-        private static void LogError(string context, Exception ex)
-        {
-            try
-            {
-                var logFile = Path.Combine(Path.GetTempPath(), "opti_pdf.log");
-                var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{context}] {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}{Environment.NewLine}";
-                lock (_logSync)
-                {
-                    File.AppendAllText(logFile, line);
-                }
-            }
-            catch
-            {
-                // Intentionally ignore logging failures.
-            }
         }
     }
 }
