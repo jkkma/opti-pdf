@@ -65,8 +65,9 @@ playbook.
   relative to the output page, *not* as the source's DPI metadata — that field
   is absent or wrong on most inputs, and keying off it means downscaling
   silently never happens.
-- Output pages are normalized to fit an **A4 box** via the density tag, so a
-  mixed batch produces consistent page sizes. Geometry (density) and
+- Output pages are normalized to fit a **216 x 330 mm (Oficio / Folio) box**
+  via the density tag, so a mixed batch produces consistent page sizes. That is
+  the paper the target documents are printed on — not A4, not US Legal. Geometry (density) and
   compression (pixel count, quality) are separate concerns — do not re-conflate
   them.
 - The `Prepare` order in `PdfOptimizer` is load-bearing: `AutoOrient` →

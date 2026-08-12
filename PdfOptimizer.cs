@@ -40,10 +40,15 @@ namespace opti_pdf
         private const double DownscaleStep = 0.8;
         private const long MinPageBudgetBytes = 16L * 1024;
 
-        // Pages are normalised to fit an A4 box so a batch of mixed sources
-        // produces consistent page sizes instead of pages measured in feet.
-        private const double PageLongEdgeInches = 11.69;
-        private const double PageShortEdgeInches = 8.27;
+        // Target paper is 216 x 330 mm (Oficio / Folio) -- the size the documents
+        // this app handles are printed on. Pages are normalised to fit that box
+        // via the density tag, so a mixed batch produces consistent page sizes
+        // instead of pages measured in feet.
+        private const double MillimetresPerInch = 25.4;
+        private const double PageLongEdgeMm = 330.0;
+        private const double PageShortEdgeMm = 216.0;
+        private const double PageLongEdgeInches = PageLongEdgeMm / MillimetresPerInch;
+        private const double PageShortEdgeInches = PageShortEdgeMm / MillimetresPerInch;
 
         // Progress bands per round. They never overlap, so the bar only ever
         // moves forward even though a job may need several rounds.
