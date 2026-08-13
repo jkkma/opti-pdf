@@ -387,7 +387,13 @@ $lines = foreach ($artifact in $artifacts) {
     '{0}  {1}' -f $hash, (Split-Path -Leaf $artifact)
 }
 $sumsPath = Join-Path $OutputDir 'SHA256SUMS.txt'
-Set-Content -LiteralPath $sumsPath -Value $lines -Encoding ASCII
+# LF, not CRLF: `sha256sum -c` (Linux, WSL, git-bash) treats the trailing \r as
+# part of the filename and fails to find the file. Windows tools do not care
+# either way, so LF is the one that works everywhere.
+[System.IO.File]::WriteAllText(
+    $sumsPath,
+    (($lines -join "`n") + "`n"),
+    (New-Object System.Text.UTF8Encoding $false))
 
 # --- summary -----------------------------------------------------------------
 
