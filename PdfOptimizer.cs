@@ -54,6 +54,15 @@ namespace opti_pdf
         // moves forward even though a job may need several rounds.
         private static readonly int[] ProgressBands = { 0, 55, 75, 88, 96 };
 
+        /// <summary>Largest page the pipeline will ever produce, in pixels.</summary>
+        private static readonly int MaxPageLongEdgePixels = (int)(MaxDpi * PageLongEdgeInches);
+        private static readonly int MaxPageShortEdgePixels = (int)(MaxDpi * PageShortEdgeInches);
+
+        // Q16 RGB is 6 bytes per pixel. A deliberate over-estimate for a
+        // greyscale page, which is the safe direction: it yields a more
+        // generous ceiling rather than a tighter one.
+        private const double CacheBytesPerPixel = 6.0;
+
         public static OptimizationResult Create(
             IReadOnlyList<PageSource> pages,
             string outputPath,
@@ -69,6 +78,19 @@ namespace opti_pdf
             string bestTemp = null;
             string promoted = null;
             long bestSize = long.MaxValue;
+
+            // Bound ImageMagick's resident pixel cache for the whole job.
+            // Beyond this it spills to disk instead of growing without limit:
+            // assembly holds every page decoded at once, which for a long
+            // document is far more than a machine wants resident.
+            var previousMemoryLimit = ResourceLimits.Memory;
+            var ceiling = PixelCacheCeilingBytes();
+
+            // Only ever lower it. An administrator's policy limit cannot be
+            // raised from here, and pretending otherwise would make the
+            // restore below a no-op too.
+            if (ceiling < previousMemoryLimit)
+                ResourceLimits.Memory = ceiling;
 
             try
             {
@@ -143,6 +165,8 @@ namespace opti_pdf
             }
             finally
             {
+                ResourceLimits.Memory = previousMemoryLimit;
+
                 foreach (var temp in temps)
                 {
                     if (string.Equals(temp, promoted, StringComparison.OrdinalIgnoreCase))
@@ -166,6 +190,18 @@ namespace opti_pdf
                 SizeBytes = bestSize,
                 WithinLimit = bestSize <= SizeLimitBytes
             };
+        }
+
+        /// <summary>
+        /// Derived from the page cap rather than from measured output, so it is
+        /// a genuine upper bound: enough for the parallel phase to hold a source
+        /// and its resized copy per worker, plus a few resident pages during
+        /// assembly.
+        /// </summary>
+        private static ulong PixelCacheCeilingBytes()
+        {
+            var pagePixels = (double)MaxPageLongEdgePixels * MaxPageShortEdgePixels;
+            return (ulong)(pagePixels * CacheBytesPerPixel * (MaxParallelism * 2 + 4));
         }
 
         private static void Promote(string tempPath, string outputPath)
@@ -285,13 +321,34 @@ namespace opti_pdf
 
                     var page = new MagickImage(output.Buffer);
 
-                    // Encoder settings live on the settings object, not on the
-                    // pixels, so they do not survive the round trip through a
-                    // buffer and have to be restated before the PDF is written.
-                    page.Quality = (uint)output.Quality;
-                    page.Settings.Compression = CompressionMethod.JPEG;
-                    page.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
-                    page.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+                    // Restate the density on every page. JPEG stores it as an
+                    // integer and the Group 4 path does not, so without this a
+                    // mixed document ends up with two different MediaBox sizes.
+                    page.Density = new Density(output.Density, output.Density, DensityUnit.PixelsPerInch);
+
+                    if (output.Bilevel)
+                    {
+                        PageBinarizer.ApplyGroup4(page, output.Density);
+                    }
+                    else
+                    {
+                        // Encoder settings live on the settings object, not on
+                        // the pixels, so they do not survive the round trip
+                        // through a buffer and have to be restated here.
+                        page.Quality = (uint)output.Quality;
+                        page.SetCompression(CompressionMethod.JPEG);
+                    }
+
+                    // Defines are document-level: the collection reads them from
+                    // the first image only. Compression is deliberately NOT set
+                    // on Settings for the same reason — doing so forces a single
+                    // codec onto every page and measured 29 MB against 1 MB for
+                    // the same two pages.
+                    if (i == 0)
+                    {
+                        page.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:2:0");
+                        page.Settings.SetDefine(MagickFormat.Jpeg, "interlace", "none");
+                    }
 
                     // The collection takes ownership and disposes its items.
                     collection.Add(page);
@@ -301,16 +358,22 @@ namespace opti_pdf
             }
 
             var info = new FileInfo(tempPath);
-            return info.Exists ? info.Length : 0;
+            var size = info.Exists ? info.Length : 0;
+
+            WarnIfOversized(outputs, size);
+            return size;
         }
 
         private static PageOutput ProcessPage(PageSource source, long budgetBytes, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            using (var img = new MagickImage(source.Path, source.CreateReadSettings()))
+            // The decode hint lets the JPEG reader scale down while decoding, so
+            // a 600 DPI scan never materialises at full size.
+            using (var img = new MagickImage(source.Path, source.CreateReadSettings(MaxPageLongEdgePixels)))
             {
                 Prepare(img);
+                cancellationToken.ThrowIfCancellationRequested();
 
                 uint maxWidth, maxHeight, minWidth, minHeight;
                 FitToPage(img.Width, img.Height, MaxDpi, out maxWidth, out maxHeight);
@@ -321,6 +384,11 @@ namespace opti_pdf
                     img.Resize(maxWidth, maxHeight);
 
                 ApplyPageDensity(img);
+
+                // A text page stored as Group 4 is far smaller than any JPEG of
+                // it, so try that before spending the quality ladder. Evaluated
+                // before the ladder runs, because the ladder mutates img.
+                var bilevel = TryBilevel(img, cancellationToken);
 
                 byte[] smallest = null;
                 var smallestQuality = MinQuality;
@@ -337,7 +405,7 @@ namespace opti_pdf
                         var buffer = Encode(img, quality);
 
                         if (buffer.Length <= budgetBytes)
-                            return NewOutput(img, buffer, quality);
+                            return Better(bilevel, NewOutput(img, buffer, quality));
 
                         if (smallest == null || buffer.Length < smallest.Length)
                         {
@@ -359,8 +427,71 @@ namespace opti_pdf
 
                 // Both floors reached and still over budget: hand back the
                 // smallest attempt. The caller tightens and rebuilds.
-                return NewOutput(img, smallest ?? Encode(img, MinQuality), smallestQuality);
+                return Better(bilevel, NewOutput(img, smallest ?? Encode(img, MinQuality), smallestQuality));
             }
+        }
+
+        /// <summary>
+        /// Returns the Group 4 rendering of a page when it is both faithful and
+        /// genuinely smaller than the JPEG alternative, otherwise null.
+        /// Measuring rather than predicting is the point: it guarantees a
+        /// bilevel page can never be larger than the JPEG it replaces, so a
+        /// noisy scan degrades to JPEG instead of becoming an irreducible cost
+        /// against the size cap.
+        /// </summary>
+        private static PageOutput TryBilevel(MagickImage img, CancellationToken cancellationToken)
+        {
+            if (!PageBinarizer.LooksLikeText(img, cancellationToken))
+                return null;
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                using (var binary = PageBinarizer.Binarize(img))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (!PageBinarizer.IsFaithful(img, binary))
+                        return null;
+
+                    var density = PageDensity(binary.Width, binary.Height);
+                    var groupFourBytes = PageBinarizer.MeasureGroup4Bytes(binary, density, cancellationToken);
+
+                    return new PageOutput
+                    {
+                        Buffer = PageBinarizer.ToBuffer(binary),
+                        MeasuredBytes = groupFourBytes,
+                        Bilevel = true,
+                        Quality = 0,
+                        Width = binary.Width,
+                        Height = binary.Height,
+                        Density = density
+                    };
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Binarization is an optimization; never let it fail the page.
+                AppLog.Error("Binarización", ex);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Picks the smaller of the bilevel candidate and the JPEG result,
+        /// comparing what each actually costs inside the PDF.
+        /// </summary>
+        private static PageOutput Better(PageOutput bilevel, PageOutput jpeg)
+        {
+            if (bilevel == null)
+                return jpeg;
+
+            return bilevel.MeasuredBytes < jpeg.MeasuredBytes ? bilevel : jpeg;
         }
 
         private static PageOutput NewOutput(MagickImage img, byte[] buffer, int quality)
@@ -368,6 +499,8 @@ namespace opti_pdf
             return new PageOutput
             {
                 Buffer = buffer,
+                MeasuredBytes = buffer.Length,
+                Bilevel = false,
                 Quality = quality,
                 Width = img.Width,
                 Height = img.Height,
@@ -474,14 +607,54 @@ namespace opti_pdf
         {
             var stage = round == 0 ? "Calidad máxima" : $"Ajuste {round}";
 
+            // A bilevel page has no quality setting, so reporting one would be
+            // meaningless.
+            var mode = output.Bilevel
+                ? "blanco y negro (G4)"
+                : $"calidad {output.Quality}";
+
             return $"[{index + 1}/{total}] {stage} - {source.DisplayName} - "
                  + $"{output.Width}x{output.Height} @ {output.Density:0} PPP - "
-                 + $"calidad {output.Quality} - {output.Buffer.Length / 1024.0:0.#} KB";
+                 + $"{mode} - {output.MeasuredBytes / 1024.0:0.#} KB";
+        }
+
+        /// <summary>
+        /// The PDF should be about the size of the page data that went into it.
+        /// A large overshoot means the writer fell back to a codec nobody asked
+        /// for, which is silent otherwise — there is no exception and the file
+        /// is still valid, just many times too big.
+        /// </summary>
+        private static void WarnIfOversized(PageOutput[] outputs, long size)
+        {
+            long expected = 0;
+            foreach (var output in outputs)
+            {
+                if (output != null)
+                    expected += output.MeasuredBytes;
+            }
+
+            if (expected <= 0 || size <= 0)
+                return;
+
+            var ratio = (double)size / expected;
+            if (ratio > 1.35)
+            {
+                AppLog.Error(
+                    "Ensamblado PDF",
+                    new InvalidOperationException(
+                        $"El PDF ({size} B) es {ratio:0.##}x el tamaño esperado ({expected} B); "
+                        + "el codificador pudo haber ignorado la compresión solicitada."));
+            }
         }
 
         private sealed class PageOutput
         {
             public byte[] Buffer { get; set; }
+
+            /// <summary>What this page costs in the output, in bytes.</summary>
+            public long MeasuredBytes { get; set; }
+
+            public bool Bilevel { get; set; }
 
             public int Quality { get; set; }
 

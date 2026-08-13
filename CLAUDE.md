@@ -7,6 +7,9 @@ size-optimized PDF using Magick.NET. Single form.
 - `PdfOptimizer.cs` — the whole image-to-PDF pipeline. No UI types.
 - `PageSource.cs` — one page of the output (a file plus a frame index, so a
   multi-page TIFF expands to one page per frame).
+- `PageBinarizer.cs` — 1-bit conversion and the text-vs-photo decision behind
+  the CCITT Group 4 path.
+- `NaturalFileComparer.cs` — human-order path sort (page2 before page10).
 - `AppLog.cs` — the shared `%TEMP%\opti_pdf.log` writer.
 
 ## Build
@@ -85,9 +88,35 @@ playbook.
 - Image processing runs in `Parallel.For` with **max degree of parallelism
   4**; PDF assembly (`MagickImageCollection`) is **single-threaded by
   design** — do not parallelize it.
-- JPEG encoder settings live on `MagickImage.Settings` and do **not** travel
-  with the pixels through a byte buffer. Restate them on each page before
-  writing the collection, or the PDF writer re-encodes with its own defaults.
+- Encoder state does **not** travel with the pixels through a byte buffer, so
+  it is restated at assembly time — but *where* it is restated matters:
+  - **Per image** (`page.Quality`, `page.SetCompression(...)`, `page.Density`):
+    correct, and required.
+  - **On `page.Settings`**: document-level. `MagickImageCollection` reads
+    settings from **image[0] only**, and they apply to every page. Never set
+    `Settings.Compression` — it forces one codec onto the whole document and
+    drops the other pages to RunLengthDecode. Measured: 29 MB versus 1 MB for
+    the same two pages. Set the JPEG defines on `i == 0` only; on later pages
+    they are silently ignored.
+- Page density must be restated on **every** page at assembly time. JPEG stores
+  density as an integer and the Group 4 path does not, so skipping it gives a
+  mixed document two different MediaBox sizes.
+- A text page may be stored as **1-bit CCITT Group 4** instead of JPEG — far
+  smaller for scans (measured 16.9 KB against 497 KB at 300 DPI). Two gates
+  guard it, and both must stay:
+  1. **Faithfulness** — binarizing must barely change the page
+     (`PageBinarizer.MaxBinarizationError`). Binarizing a photo destroys it.
+  2. **Measured size** — the real Group 4 output is encoded and compared against
+     the JPEG that would otherwise ship, and the smaller one wins. This is what
+     guarantees a bilevel page is never *larger* than the JPEG it replaces, so
+     a noisy scan degrades to JPEG instead of becoming an irreducible cost
+     against the size cap. Never replace this with a predicted size — the PNG
+     carrier buffer is off by an order of magnitude.
+  The thresholds are tuned on synthetic pages; revisit them against real scans.
+- Source images are decoded with a `jpeg:size` hint so a 600 DPI scan never
+  materializes at full resolution. `MagickReadSettings.Width`/`.Height` look
+  like they do this but are ignored by the JPEG reader. It is only a hint —
+  the reader picks its own fraction — so callers must still resize.
 - `MagickImageCollection` takes ownership of images added to it — add directly,
   do not clone defensively, and do not dispose what you added.
 
@@ -101,5 +130,8 @@ playbook.
 - Errors are logged to `%TEMP%\opti_pdf.log` via `AppLog.Error(context, ex)`;
   never let logging throw.
 - Anything that mutates the page list must be disabled while a conversion runs
-  — including `AllowDrop`, since the worker iterates the list from a background
-  thread.
+  — including `AllowDrop`.
+- Each added batch is sorted with `NaturalFileComparer`, but the list as a
+  whole is never re-sorted: a cover page the user placed first stays first.
+  List order is PDF order, and the ListView caption carries the page number
+  because nothing else on screen conveys it.

@@ -94,6 +94,8 @@
       <DependentUpon>Form1.cs</DependentUpon>
     </Compile>
     <Compile Include="AppLog.cs" />
+    <Compile Include="NaturalFileComparer.cs" />
+    <Compile Include="PageBinarizer.cs" />
     <Compile Include="PageSource.cs" />
     <Compile Include="PdfOptimizer.cs" />
     <Compile Include="Program.cs" />

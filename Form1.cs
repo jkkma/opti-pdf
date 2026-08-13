@@ -17,6 +17,9 @@ namespace opti_pdf
         private string _lastDetailStatus = "LISTO";
         private bool _closeRequested;
 
+        /// <summary>Decode-size hint for thumbnails; the large icon is 128 px.</summary>
+        private const int ThumbnailDecodeHint = 256;
+
         public Form1()
         {
             InitializeComponent();
@@ -245,6 +248,7 @@ namespace opti_pdf
                 lvImages.Items.Remove(it);
             }
 
+            RenumberPages();
             lblStatus.Text = $"Se eliminaron {items.Length} elemento(s)";
         }
 
@@ -270,26 +274,98 @@ namespace opti_pdf
             if (IsBusy || e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop))
                 return;
 
-            var files = (string[])e.Data.GetData(DataFormats.FileDrop);
-            var images = files.Where(f =>
-            {
-                var ext = Path.GetExtension(f)?.ToLowerInvariant();
-                return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".tif" || ext == ".tiff" || ext == ".gif";
-            }).ToArray();
+            var dropped = (string[])e.Data.GetData(DataFormats.FileDrop);
+            var images = ExpandDrop(dropped).ToArray();
 
             if (images.Length > 0)
                 AddFiles(images);
+            else
+                lblStatus.Text = "No se encontraron imágenes en lo que se soltó";
+        }
+
+        private static bool IsSupportedImage(string path)
+        {
+            var ext = Path.GetExtension(path)?.ToLowerInvariant();
+
+            return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp"
+                || ext == ".tif" || ext == ".tiff" || ext == ".gif";
+        }
+
+        /// <summary>
+        /// Turns a drop payload into image paths. Dropping the folder a scanner
+        /// wrote is the natural way to add a document, and previously did
+        /// nothing at all: the payload is a directory, which matched no
+        /// extension and silently produced no pages.
+        /// </summary>
+        private static IEnumerable<string> ExpandDrop(IEnumerable<string> paths)
+        {
+            foreach (var path in paths)
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                    continue;
+
+                var isDirectory = false;
+                try
+                {
+                    isDirectory = Directory.Exists(path);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error($"Carpeta {path}", ex);
+                }
+
+                if (!isDirectory)
+                {
+                    if (IsSupportedImage(path))
+                        yield return path;
+
+                    continue;
+                }
+
+                string[] entries = null;
+                try
+                {
+                    entries = Directory.GetFiles(path, "*", SearchOption.AllDirectories);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error($"Carpeta {path}", ex);
+                }
+
+                if (entries == null)
+                    continue;
+
+                foreach (var entry in entries)
+                {
+                    if (IsSupportedImage(entry))
+                        yield return entry;
+                }
+            }
         }
 
         private void AddFiles(IEnumerable<string> files)
         {
+            var batch = files.Where(f => !string.IsNullOrWhiteSpace(f)).ToList();
+
+            // Order each batch the way a person reads the names, so page2 lands
+            // before page10 rather than after it. Only the batch is sorted, not
+            // the whole list, so a cover page the user added deliberately first
+            // stays first.
+            try
+            {
+                batch.Sort(NaturalFileComparer.Instance);
+            }
+            catch (Exception ex)
+            {
+                // A comparer that throws inside Sort would otherwise take down
+                // the whole batch; unsorted is still usable.
+                AppLog.Error("Ordenar por nombre", ex);
+            }
+
             var added = 0;
 
-            foreach (var file in files)
+            foreach (var file in batch)
             {
-                if (string.IsNullOrWhiteSpace(file))
-                    continue;
-
                 IEnumerable<PageSource> pages;
                 try
                 {
@@ -330,12 +406,38 @@ namespace opti_pdf
                 }
             }
 
-            lblStatus.Text = $"Se agregaron {added} página(s)";
+            RenumberPages();
+
+            lblStatus.Text = added > 0
+                ? $"Se agregaron {added} página(s), ordenadas por nombre"
+                : "No se agregaron páginas nuevas";
+        }
+
+        /// <summary>
+        /// Puts the page number in front of every caption. The list order is the
+        /// PDF order, and without an ordinal nothing on screen says which
+        /// thumbnail is page 7 — the "[3/12]" in a multi-frame TIFF's name is a
+        /// frame number and reads as a page number when it is not one.
+        /// </summary>
+        private void RenumberPages()
+        {
+            lvImages.BeginUpdate();
+            try
+            {
+                for (var i = 0; i < lvImages.Items.Count && i < _pages.Count; i++)
+                    lvImages.Items[i].Text = $"{i + 1}. {_pages[i].DisplayName}";
+            }
+            finally
+            {
+                lvImages.EndUpdate();
+            }
         }
 
         private void AddThumbnails(PageSource page)
         {
-            using (var original = new MagickImage(page.Path, page.CreateReadSettings()))
+            // Decode straight to roughly thumbnail size rather than reading a
+            // full 300 DPI page and throwing almost all of it away.
+            using (var original = new MagickImage(page.Path, page.CreateReadSettings(ThumbnailDecodeHint)))
             {
                 // Match what the output will look like: without this the
                 // thumbnail of a rotated phone photo disagrees with the page.
