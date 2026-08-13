@@ -40,23 +40,20 @@ namespace opti_pdf
         private const double DownscaleStep = 0.8;
         private const long MinPageBudgetBytes = 16L * 1024;
 
-        // Target paper is 216 x 330 mm (Oficio / Folio) -- the size the documents
-        // this app handles are printed on. Pages are normalised to fit that box
-        // via the density tag, so a mixed batch produces consistent page sizes
-        // instead of pages measured in feet.
-        private const double MillimetresPerInch = 25.4;
-        private const double PageLongEdgeMm = 330.0;
-        private const double PageShortEdgeMm = 216.0;
-        private const double PageLongEdgeInches = PageLongEdgeMm / MillimetresPerInch;
-        private const double PageShortEdgeInches = PageShortEdgeMm / MillimetresPerInch;
-
         // Progress bands per round. They never overlap, so the bar only ever
         // moves forward even though a job may need several rounds.
         private static readonly int[] ProgressBands = { 0, 55, 75, 88, 96 };
 
+        /// <summary>
+        /// Page sizes, in grid units, that bound the whole pipeline. Every page
+        /// measures 216 x 330 mm regardless; these only bound its resolution.
+        /// </summary>
+        private static readonly int MaxPageUnits = PageGeometry.MaxUnits(MaxDpi);
+        private static readonly int MinPageUnits = PageGeometry.MinUnits(MinDpi);
+
         /// <summary>Largest page the pipeline will ever produce, in pixels.</summary>
-        private static readonly int MaxPageLongEdgePixels = (int)(MaxDpi * PageLongEdgeInches);
-        private static readonly int MaxPageShortEdgePixels = (int)(MaxDpi * PageShortEdgeInches);
+        private static readonly int MaxPageLongEdgePixels = (int)(PageGeometry.GridLongEdge * MaxPageUnits);
+        private static readonly int MaxPageShortEdgePixels = (int)(PageGeometry.GridShortEdge * MaxPageUnits);
 
         // Q16 RGB is 6 bytes per pixel. A deliberate over-estimate for a
         // greyscale page, which is the safe direction: it yields a more
@@ -233,9 +230,11 @@ namespace opti_pdf
                     {
                         probe.Ping(pages[i].Path, pages[i].CreateReadSettings());
 
-                        uint width, height;
-                        FitToPage(probe.Width, probe.Height, MaxDpi, out width, out height);
-                        weights[i] = (long)width * height;
+                        // Weigh by the page this image will occupy, not by the
+                        // image: the white margin around a page that does not
+                        // match the sheet's shape is part of what it costs.
+                        var canvas = PageGeometry.Choose(probe.Width, probe.Height, MaxDpi);
+                        weights[i] = (long)canvas.Width * canvas.Height;
                     }
                 }
                 catch (Exception ex)
@@ -321,10 +320,12 @@ namespace opti_pdf
 
                     var page = new MagickImage(output.Buffer);
 
-                    // Restate the density on every page. JPEG stores it as an
-                    // integer and the Group 4 path does not, so without this a
-                    // mixed document ends up with two different MediaBox sizes.
-                    page.Density = new Density(output.Density, output.Density, DensityUnit.PixelsPerInch);
+                    // Restate the page box on every page. The PDF coder derives
+                    // /MediaBox from the page geometry divided by the density,
+                    // and JPEG stores density as an integer where the Group 4
+                    // path does not, so without this a mixed document ends up
+                    // with two different page sizes.
+                    PageGeometry.Apply(page, output.Density);
 
                     if (output.Bilevel)
                     {
@@ -375,20 +376,26 @@ namespace opti_pdf
                 Prepare(img);
                 cancellationToken.ThrowIfCancellationRequested();
 
-                uint maxWidth, maxHeight, minWidth, minHeight;
-                FitToPage(img.Width, img.Height, MaxDpi, out maxWidth, out maxHeight);
-                FitToPage(img.Width, img.Height, MinDpi, out minWidth, out minHeight);
+                var canvas = PageGeometry.Choose(img.Width, img.Height, MaxDpi);
+
+                // A page already below the DPI floor is a small source, which is
+                // never enlarged and so has no resolution left to give up. Its
+                // own size is the floor.
+                var floorUnits = Math.Min(canvas.Units, MinPageUnits);
 
                 img.FilterType = FilterType.Cubic;
-                if (maxWidth < img.Width || maxHeight < img.Height)
-                    img.Resize(maxWidth, maxHeight);
-
-                ApplyPageDensity(img);
+                PageGeometry.Fit(img, canvas);
 
                 // A text page stored as Group 4 is far smaller than any JPEG of
                 // it, so try that before spending the quality ladder. Evaluated
-                // before the ladder runs, because the ladder mutates img.
-                var bilevel = TryBilevel(img, cancellationToken);
+                // before the ladder runs, because the ladder mutates img, and
+                // before the page is padded, because PageBinarizer's gates are
+                // tuned against a page's own content: white margin lowers both
+                // the ink percentage and the measured error, which would let a
+                // photograph through the faithfulness check and destroy it.
+                var bilevel = TryBilevel(img, canvas, cancellationToken);
+
+                PageGeometry.Place(img, canvas);
 
                 byte[] smallest = null;
                 var smallestQuality = MinQuality;
@@ -405,7 +412,7 @@ namespace opti_pdf
                         var buffer = Encode(img, quality);
 
                         if (buffer.Length <= budgetBytes)
-                            return Better(bilevel, NewOutput(img, buffer, quality));
+                            return Better(bilevel, NewOutput(img, canvas, buffer, quality));
 
                         if (smallest == null || buffer.Length < smallest.Length)
                         {
@@ -414,20 +421,21 @@ namespace opti_pdf
                         }
                     }
 
-                    // Quality alone was not enough. Drop resolution, but never
-                    // below the floor of MinDpi on the page.
-                    var nextWidth = (uint)Math.Max(1, Math.Round(img.Width * DownscaleStep));
-                    var nextHeight = (uint)Math.Max(1, Math.Round(img.Height * DownscaleStep));
-                    if (nextWidth < minWidth || nextHeight < minHeight)
+                    // Quality alone was not enough. Shrink the page itself, but
+                    // never past the DPI floor. Stepping in grid units rather
+                    // than in pixels is what keeps the box exact: the smaller
+                    // page still measures 216 x 330 mm.
+                    var nextUnits = (int)Math.Round(canvas.Units * DownscaleStep);
+                    if (nextUnits < floorUnits || nextUnits >= canvas.Units)
                         break;
 
-                    img.Resize(nextWidth, nextHeight);
-                    ApplyPageDensity(img);
+                    canvas = PageGeometry.WithUnits(canvas, nextUnits);
+                    PageGeometry.Place(img, canvas);
                 }
 
                 // Both floors reached and still over budget: hand back the
                 // smallest attempt. The caller tightens and rebuilds.
-                return Better(bilevel, NewOutput(img, smallest ?? Encode(img, MinQuality), smallestQuality));
+                return Better(bilevel, NewOutput(img, canvas, smallest ?? Encode(img, MinQuality), smallestQuality));
             }
         }
 
@@ -439,7 +447,7 @@ namespace opti_pdf
         /// noisy scan degrades to JPEG instead of becoming an irreducible cost
         /// against the size cap.
         /// </summary>
-        private static PageOutput TryBilevel(MagickImage img, CancellationToken cancellationToken)
+        private static PageOutput TryBilevel(MagickImage img, PageCanvas canvas, CancellationToken cancellationToken)
         {
             if (!PageBinarizer.LooksLikeText(img, cancellationToken))
                 return null;
@@ -455,8 +463,13 @@ namespace opti_pdf
                     if (!PageBinarizer.IsFaithful(img, binary))
                         return null;
 
-                    var density = PageDensity(binary.Width, binary.Height);
-                    var groupFourBytes = PageBinarizer.MeasureGroup4Bytes(binary, density, cancellationToken);
+                    // Both gates have had their say on the page's own content;
+                    // only now does it go onto the sheet. The margin costs a
+                    // Group 4 page nothing — measured 7570 B padded against
+                    // 7590 B bare, so slightly less.
+                    PageGeometry.Place(binary, canvas);
+
+                    var groupFourBytes = PageBinarizer.MeasureGroup4Bytes(binary, canvas.Density, cancellationToken);
 
                     return new PageOutput
                     {
@@ -466,7 +479,7 @@ namespace opti_pdf
                         Quality = 0,
                         Width = binary.Width,
                         Height = binary.Height,
-                        Density = density
+                        Density = canvas.Density
                     };
                 }
             }
@@ -494,7 +507,7 @@ namespace opti_pdf
             return bilevel.MeasuredBytes < jpeg.MeasuredBytes ? bilevel : jpeg;
         }
 
-        private static PageOutput NewOutput(MagickImage img, byte[] buffer, int quality)
+        private static PageOutput NewOutput(MagickImage img, PageCanvas canvas, byte[] buffer, int quality)
         {
             return new PageOutput
             {
@@ -504,7 +517,7 @@ namespace opti_pdf
                 Quality = quality,
                 Width = img.Width,
                 Height = img.Height,
-                Density = PageDensity(img.Width, img.Height)
+                Density = canvas.Density
             };
         }
 
@@ -559,39 +572,6 @@ namespace opti_pdf
                 img.Write(ms);
                 return ms.ToArray();
             }
-        }
-
-        /// <summary>
-        /// Scales <paramref name="width"/> x <paramref name="height"/> down to
-        /// what <paramref name="dpi"/> is worth on the output page. Never
-        /// upscales, so a small source keeps its own pixels.
-        /// </summary>
-        private static void FitToPage(uint width, uint height, int dpi, out uint fitWidth, out uint fitHeight)
-        {
-            double longPixels = Math.Max(width, height);
-            double shortPixels = Math.Min(width, height);
-
-            var scale = Math.Min(
-                1.0,
-                Math.Min(dpi * PageLongEdgeInches / longPixels, dpi * PageShortEdgeInches / shortPixels));
-
-            fitWidth = (uint)Math.Max(1, Math.Round(width * scale));
-            fitHeight = (uint)Math.Max(1, Math.Round(height * scale));
-        }
-
-        /// <summary>Density that makes the image exactly fill the page box.</summary>
-        private static double PageDensity(uint width, uint height)
-        {
-            double longPixels = Math.Max(width, height);
-            double shortPixels = Math.Min(width, height);
-
-            return Math.Max(longPixels / PageLongEdgeInches, shortPixels / PageShortEdgeInches);
-        }
-
-        private static void ApplyPageDensity(MagickImage img)
-        {
-            var density = PageDensity(img.Width, img.Height);
-            img.Density = new Density(density, density, DensityUnit.PixelsPerInch);
         }
 
         private static int ProgressFor(int round, int done, int total)

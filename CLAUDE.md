@@ -68,11 +68,27 @@ playbook.
   relative to the output page, *not* as the source's DPI metadata — that field
   is absent or wrong on most inputs, and keying off it means downscaling
   silently never happens.
-- Output pages are normalized to fit a **216 x 330 mm (Oficio / Folio) box**
-  via the density tag, so a mixed batch produces consistent page sizes. That is
-  the paper the target documents are printed on — not A4, not US Legal. Geometry (density) and
-  compression (pixel count, quality) are separate concerns — do not re-conflate
-  them.
+- Every output page is **exactly 216 x 330 mm (Oficio / Folio)** —
+  `/MediaBox [0 0 612.283 935.433]`, or its transpose on a landscape page. That
+  is the paper the target documents are printed on — not A4, not US Legal. The
+  page is chosen first and the image is placed into it: scaled to fit, centred,
+  the rest of the sheet white. All of this lives in `PageGeometry.cs`.
+  - Fitting by density alone is what this replaced, and it does **not** give
+    uniform pages: whichever edge ran out first pinned the density, so one
+    document measured 216x330, 216x324, 188x330 and 324x216 mm across four
+    pages.
+  - The exactness rests on the **36:55 grid**. gcd(216, 330) is 6, so a canvas
+    of `36k x 55k` px at `25.4k/6` DPI measures the sheet exactly for *every*
+    `k` — which is what lets pages of different resolutions agree on the box to
+    the last digit. Page pixel dimensions must stay on that grid: resize a page
+    by changing `k`, never by scaling its pixels off-grid.
+  - `k` is the resolution knob, and the only one: `MaxDpi` 300 caps it at
+    `k=70` (296.33 DPI) and the 150 DPI floor at `k=36` (152.4 DPI).
+  - The page box follows the **image's** orientation, so a landscape scan gets a
+    landscape Oficio page rather than letterboxing into a portrait one at 66%
+    linear scale. A mixed-orientation batch therefore has two page sizes — the
+    same sheet, turned.
+- Geometry and compression stay separate concerns — do not re-conflate them.
 - The `Prepare` order in `PdfOptimizer` is load-bearing: `AutoOrient` →
   colour-profile conversion → alpha flatten → `Strip`. Stripping first destroys
   the EXIF orientation and the ICC profile the earlier steps need, and PDF has
@@ -98,9 +114,12 @@ playbook.
     drops the other pages to RunLengthDecode. Measured: 29 MB versus 1 MB for
     the same two pages. Set the JPEG defines on `i == 0` only; on later pages
     they are silently ignored.
-- Page density must be restated on **every** page at assembly time. JPEG stores
-  density as an integer and the Group 4 path does not, so skipping it gives a
-  mixed document two different MediaBox sizes.
+- The page box must be restated on **every** page at assembly time, via
+  `PageGeometry.Apply`. The PDF coder emits `/MediaBox` as the image's page
+  geometry divided by its density, so both halves matter and both get lost on
+  the way: JPEG stores density as an integer where the Group 4 path does not,
+  and `Extent` *grows* the page geometry instead of replacing it — a stale
+  10199x10388 measured a 5102 x 5196 pt box.
 - A text page may be stored as **1-bit CCITT Group 4** instead of JPEG — far
   smaller for scans (measured 16.9 KB against 497 KB at 300 DPI). Two gates
   guard it, and both must stay:
@@ -113,10 +132,19 @@ playbook.
      against the size cap. Never replace this with a predicted size — the PNG
      carrier buffer is off by an order of magnitude.
   The thresholds are tuned on synthetic pages; revisit them against real scans.
+  Both gates run **before** the page is padded onto the sheet, and must keep
+  doing so: they are calibrated against a page's own content, and white margin
+  lowers both the ink percentage and the measured error — enough to walk a
+  photograph through the faithfulness check and destroy it.
 - Source images are decoded with a `jpeg:size` hint so a 600 DPI scan never
   materializes at full resolution. `MagickReadSettings.Width`/`.Height` look
   like they do this but are ignored by the JPEG reader. It is only a hint —
-  the reader picks its own fraction — so callers must still resize.
+  the reader picks its own fraction — so callers must still resize. **Set it
+  only when the source is genuinely larger than the request**: libjpeg's scaled
+  decode enlarges as readily as it shrinks, and a 3000x2000 source asked for
+  3850x3850 decoded to 5625x3750 — three times the memory, and a resolution the
+  source cannot back. No geometry qualifier suppresses it; `>`, `^` and `!` all
+  measured the same enlargement, so the source size has to be checked first.
 - `MagickImageCollection` takes ownership of images added to it — add directly,
   do not clone defensively, and do not dispose what you added.
 
