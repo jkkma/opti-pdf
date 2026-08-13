@@ -1,11 +1,14 @@
 name: Release
 
-# Push a tag that matches the version in Properties/AssemblyInfo.cs:
+# Two ways to cut a release, both ending in the same GitHub Release:
 #
-#     git tag v1.0.0 && git push origin v1.0.0
+#   1. Push a tag:  git tag v1.0.0 && git push origin v1.0.0
+#   2. Run this workflow manually from the Actions tab. It tags the commit it
+#      built, which is also the way to release without tag-push rights.
 #
-# build-release.ps1 refuses to build if the two disagree, so bump
-# AssemblyVersion/AssemblyFileVersion first.
+# Either way the version comes from Properties/AssemblyInfo.cs and
+# build-release.ps1 refuses to build if a passed version disagrees with it, so
+# bump AssemblyVersion/AssemblyFileVersion first.
 on:
   push:
     tags:
@@ -77,19 +80,34 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+          SHA: ${{ github.sha }}
         run: |
-          $files = Get-ChildItem -LiteralPath dist -File |
-            Where-Object { $_.Extension -in '.exe', '.zip' -or $_.Name -eq 'SHA256SUMS.txt' }
+          $files = @(Get-ChildItem -LiteralPath dist -File |
+            Where-Object { $_.Extension -in '.exe', '.zip' -or $_.Name -eq 'SHA256SUMS.txt' })
           if (-not $files) { throw 'No artifacts found in dist.' }
 
-          $ghArgs = @('release', 'create', $env:TAG, '--title', $env:TAG, '--generate-notes')
-          # A tag like v1.1.0-rc1 ships as a pre-release.
-          if ($env:TAG -match '-') { $ghArgs += '--prerelease' }
+          # Take the version from the artifact that was actually built rather
+          # than re-deriving it, so the tag can never name a different version
+          # than the installer inside the release.
+          $setup = $files | Where-Object { $_.Name -like '*-setup.exe' } | Select-Object -First 1
+          if (-not $setup) { throw 'No installer found in dist.' }
+          if ($setup.Name -notmatch '^opti-pdf-(.+)-setup\.exe$') {
+            throw "Cannot read a version out of $($setup.Name)."
+          }
+          # Capture before any other -match resets $Matches.
+          $version = $Matches[1]
+          $tag = "v$version"
+          Write-Host "Publishing $tag"
+
+          $ghArgs = @('release', 'create', $tag, '--title', $tag, '--generate-notes')
+          # A version like 1.1.0-rc1 ships as a pre-release.
+          if ($version -match '-') { $ghArgs += '--prerelease' }
+          # On a manual run no tag exists yet; create it on the built commit.
+          if ($env:IS_TAG -ne 'true') { $ghArgs += @('--target', $env:SHA) }
           $ghArgs += $files.FullName
 
           & gh @ghArgs
