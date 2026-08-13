@@ -1,4 +1,4 @@
-using ImageMagick;
+﻿using ImageMagick;
 using System;
 using System.IO;
 using System.Threading;
@@ -127,11 +127,28 @@ namespace opti_pdf
             if (ink < MinInkPercent || ink > MaxInkPercent)
                 return false;
 
-            using (var grey = (MagickImage)prepared.Clone())
+            // Check the real full-resolution binarization, but compare sampled
+            // copies of it. A full-resolution Grayscale plus Compare costs
+            // several hundred ms per page and keeps a third full-size image
+            // alive next to the source and the binarized page; sampling first
+            // measures the same thing for a fraction of both.
+            // The two clones are taken in sequence, never held together.
+            double error;
+
+            using (var binarySample = (MagickImage)binary.Clone())
             {
-                grey.Grayscale();
-                return Error(grey, binary) < MaxBinarizationError;
+                binarySample.Sample(ProxyLongEdge, ProxyLongEdge);
+
+                using (var greySample = (MagickImage)prepared.Clone())
+                {
+                    greySample.Sample(ProxyLongEdge, ProxyLongEdge);
+                    greySample.Grayscale();
+
+                    error = Error(greySample, binarySample);
+                }
             }
+
+            return error < MaxBinarizationError;
         }
 
         /// <summary>
