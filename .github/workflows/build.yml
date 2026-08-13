@@ -2,6 +2,9 @@ name: Build
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
@@ -12,14 +15,25 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Restore NuGet packages
-        run: nuget restore opti-pdf.csproj -PackagesDirectory packages
+      # Packaging runs on every push so a broken .iss or staging rule is
+      # caught here rather than at tag time.
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (Get-Command ISCC.exe -ErrorAction SilentlyContinue) { exit 0 }
+          if (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") { exit 0 }
+          choco install innosetup --no-progress --yes
 
-      - name: Build (Release)
-        run: msbuild opti-pdf.csproj /p:Configuration=Release
+      - name: Build release artifacts
+        shell: pwsh
+        run: .\scripts\build-release.ps1
 
-      - name: Upload build output
+      - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: opti-pdf
-          path: bin/Release
+          name: opti-pdf-windows
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error

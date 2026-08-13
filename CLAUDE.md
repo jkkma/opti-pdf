@@ -23,6 +23,55 @@ size-optimized PDF using Magick.NET. Single form.
   Linux. First run ~15 s (downloads packages), incremental ~3 s.
 - Never edit anything under `packages/`, `bin/` or `obj/` — restored/generated.
 
+## Releases
+
+`scripts/build-release.ps1` (Windows only) produces both shipped artifacts
+into `dist/` — `opti-pdf-<version>-setup.exe` from `installer/opti-pdf.iss`
+and `opti-pdf-<version>-portable.zip` — from one staged payload, so the two
+can never drift apart. `.github/workflows/build.yml` runs it on every push;
+`release.yml` runs it on a `v*` tag and attaches the result to a GitHub
+Release.
+
+- `Properties/AssemblyInfo.cs` is the **single source of truth for the
+  version**. The script derives the version from `AssemblyFileVersion`, and
+  refuses to build when an explicit `-Version` (or a tag) disagrees with it —
+  otherwise the installer and the exe inside it claim different versions.
+  Only the numeric core is compared, so `v1.1.0-rc1` is a valid tag for
+  `1.1.0.0`.
+- The payload is `bin\Release` minus `*.pdb` and `*.xml`, plus
+  `installer/LEEME.txt`. A new *runtime* dependency therefore ships by
+  itself; anything that is not a build output has to be added to the staging
+  step by hand.
+- **All three `Magick.Native-Q16-*.dll` must ship.** Magick.NET picks one at
+  run time from the process architecture, and .NET Framework 4.8.1 runs
+  natively on ARM64 Windows — the arm64 copy is not dead weight, even though
+  no other part of the tree mentions ARM.
+- The floor is **Windows 7 SP1** (`MinVersion=6.1sp1`), and it is *checked*,
+  not assumed: the script reads the PE `MajorSubsystemVersion` of every
+  shipped binary and of the compiled installer and fails the build on anything
+  newer than 6.1. That is the field Windows itself uses to refuse to start an
+  image, so it catches both a dependency bump and an Inno Setup major that
+  drops Windows 7 — neither of which would otherwise surface before a user
+  report. The arm64 native library is exempt (ARM64 Windows is 10+).
+  `Resolve-Iscc` deliberately accepts any installed `Inno Setup *` version
+  because of this check, rather than pinning one.
+- `installer/opti-pdf.iss` is **UTF-8 with a BOM**. Without one Inno Setup 6
+  reads it in the system ANSI codepage and mangles the accents in the Spanish
+  messages. `.gitattributes` pins it (and `LEEME.txt`) to CRLF.
+- The installer is **Spanish-only** — one `[Languages]` entry, so no language
+  picker appears — matching the app's own convention below.
+- `AppId` in the `.iss` must never change: it is what lets a new version
+  upgrade an old install instead of leaving two entries in Programs and
+  Features.
+- The installer defaults to a **per-user** install (`PrivilegesRequired=lowest`)
+  because the app runs `asInvoker`, so a normal install needs no UAC prompt at
+  all. That only holds while the app keeps writing nothing but
+  `%TEMP%\opti_pdf.log` — no `Properties.Settings`, no files next to the exe.
+  Break that and the portable folder stops being portable and an all-users
+  install under `Program Files` starts failing for non-admins.
+- Neither artifact is code-signed; SmartScreen warns on first run. `LEEME.txt`
+  tells users so.
+
 ## Legacy project format (not SDK-style)
 
 `opti-pdf.csproj` is an old-style csproj with `packages.config`. Nothing is

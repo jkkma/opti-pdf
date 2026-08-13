@@ -1,0 +1,85 @@
+﻿Opti-PDF
+========
+
+Convierte imágenes en un único PDF optimizado que no supera los 5 MB. Cada
+página del PDF mide exactamente 216 x 330 mm (Oficio).
+
+Formatos admitidos: JPG, JPEG, PNG, BMP, TIF, TIFF y GIF. Un TIFF de varias
+páginas se convierte en una página del PDF por cada imagen que contiene.
+
+
+Requisitos
+----------
+
+- Windows 7 SP1, 8.1, 10 u 11 (32 o 64 bits, también ARM64).
+- Microsoft .NET Framework 4.8 o posterior.
+  Descarga: https://dotnet.microsoft.com/download/dotnet-framework/net48
+
+  Windows 10 (desde la actualización de mayo de 2019) y Windows 11 ya lo
+  incluyen: no tienes que hacer nada.
+
+  En Windows 7 SP1 casi nunca viene instalado. Antes de instalarlo, pasa
+  Windows Update hasta el final: .NET Framework 4.8 necesita el soporte de
+  firma SHA-2 (actualización KB4474419) y no se instala sin él.
+
+El instalador comprueba .NET Framework antes de copiar nada y te avisa si
+falta.
+
+
+Versión portable
+----------------
+
+Si has descargado el archivo .zip, no hace falta instalar nada:
+
+1. Descomprime la carpeta completa donde quieras (por ejemplo en el
+   escritorio o en una memoria USB).
+2. Ejecuta opti-pdf.exe desde dentro de esa carpeta.
+
+Mantén todos los archivos juntos: el programa necesita las bibliotecas
+que le acompañan en la misma carpeta. Si Windows muestra un aviso de
+SmartScreen, elige "Más información" y luego "Ejecutar de todas formas".
+
+Para desinstalarla basta con borrar la carpeta. El programa no escribe
+nada en el registro de Windows.
+
+
+Versión con instalador
+----------------------
+
+Si has descargado el archivo -setup.exe, ejecútalo y sigue los pasos. Podrás
+elegir entre instalar solo para tu usuario (no pide permisos de
+administrador) o para todos los usuarios del equipo.
+
+Para desinstalarlo, usa "Aplicaciones y características" de Windows.
+
+
+Uso
+---
+
+1. Arrastra las imágenes a la ventana, o pulsa "Agregar imágenes".
+2. El orden de la lista es el orden de las páginas del PDF. Cada grupo de
+   imágenes que agregas se ordena por nombre (página2 antes que página10) y
+   se añade al final, así que una portada que agregues primero se queda
+   primera. Usa "Eliminar seleccionados" o "Borrar todo" para corregir.
+3. Pulsa "CREAR PDF" y elige dónde guardarlo. Puedes interrumpir el proceso
+   con "Cancelar"; el archivo de destino no se toca si cancelas.
+
+Si el PDF no puede bajar de 5 MB sin perder demasiada calidad, el programa
+lo guarda igualmente y te avisa de que ha quedado por encima del límite.
+
+
+Registro de errores
+-------------------
+
+Los errores se anotan en:
+
+    %TEMP%\opti_pdf.log
+
+Pega la ruta en el explorador de archivos para abrirlo. Adjunta ese archivo
+si necesitas informar de un problema.
+
+
+Código fuente y novedades
+-------------------------
+
+https://github.com/jkkma/opti-pdf

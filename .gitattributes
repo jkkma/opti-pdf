@@ -61,3 +61,15 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# Windows packaging.
+#
+# Inno Setup 6 only reads a .iss as UTF-8 when it starts with a BOM (otherwise
+# it falls back to the system ANSI codepage and mangles the Spanish accents),
+# and LEEME.txt ships to users who will open it in Notepad. Keep both CRLF so
+# they read correctly however the tree was checked out.
+###############################################################################
+*.iss              text eol=crlf
+*.ps1              text eol=crlf
+installer/LEEME.txt text eol=crlf
